@@ -7,6 +7,7 @@ import { createJwtAuthenticator, canManageOrganization, type AuthPrincipal, type
 import { loadConfig, type AppConfig } from './config.js';
 import {
   agentControlMessage,
+  agentKeyId,
   assertEd25519PublicKey,
   canonicalize,
   challengeDigest,
@@ -15,8 +16,11 @@ import {
   verifyAgentControlSignature,
   verifySandboxWebhook,
 } from './crypto.js';
+import { registerCredentialRoutes } from './credentials/routes.js';
+import { PostgresCredentialLifecycleStore } from './credentials/store-postgres.js';
+import type { CredentialLifecycleStore } from './credentials/store.js';
 import { assertReferralAllowed, passportSaleEntries, PassportSigner, type AgentRecord } from './domain.js';
-import { PostgresPlatformStore } from './db/store-postgres.js';
+import { PostgresLifecyclePlatformStore } from './db/store-postgres-lifecycle.js';
 import type { PaymentProvider } from './payments/provider.js';
 import { SandboxPaymentProvider } from './payments/sandbox.js';
 import type { PlatformStore } from './store.js';
@@ -38,6 +42,7 @@ export interface AppDependencies {
   authenticate: Authenticator;
   paymentProvider: PaymentProvider;
   config: RuntimeConfig;
+  credentials?: CredentialLifecycleStore;
 }
 
 const agentCreateSchema = z.object({
@@ -81,7 +86,10 @@ export async function buildApp(deps: AppDependencies) {
         'req.headers.cookie',
         'req.headers.x-sandbox-signature',
         'req.body.public_key_pem',
+        'req.body.new_public_key_pem',
         'req.body.signature',
+        'req.body.current_key_signature',
+        'req.body.new_key_signature',
       ],
     },
     bodyLimit: 1_048_576,
@@ -188,7 +196,25 @@ export async function buildApp(deps: AppDependencies) {
     const { agentId } = request.params as { agentId: string };
     const agent = await deps.store.getAgent(agentId);
     if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
-    return { agent_id: agent.publicId, key_id: 'primary', algorithm: 'Ed25519', public_key_pem: agent.publicKeyPem };
+    try {
+      const key = deps.credentials
+        ? await deps.credentials.getCurrentKey(agent)
+        : {
+            keyId: agentKeyId(agent.publicKeyPem),
+            algorithm: 'Ed25519' as const,
+            publicKeyPem: agent.publicKeyPem,
+            activatedAt: agent.controlVerifiedAt ?? new Date(0).toISOString(),
+          };
+      return {
+        agent_id: agent.publicId,
+        key_id: key.keyId,
+        algorithm: key.algorithm,
+        public_key_pem: key.publicKeyPem,
+        activated_at: key.activatedAt,
+      };
+    } catch {
+      return reply.code(404).send({ code: 'ACTIVE_AGENT_KEY_NOT_FOUND' });
+    }
   });
 
   app.post('/v1/agents/:agentId/challenge', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
@@ -198,12 +224,28 @@ export async function buildApp(deps: AppDependencies) {
     const agent = await deps.store.getAgent(agentId);
     if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
     if (!canManageAgent(principal, agent)) return reply.code(403).send({ code: 'TENANT_ACCESS_DENIED' });
+    if (agent.status === 'suspended' || agent.status === 'revoked') {
+      return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_CONTROL_CHALLENGE', status: agent.status });
+    }
     const challenge = createChallenge();
+    const digest = challengeDigest(challenge);
     const expiresAt = new Date(Date.now() + 120_000);
-    await deps.store.createChallenge({ agentId: agent.id, digest: challengeDigest(challenge), expiresAt });
+    let keyId = agentKeyId(agent.publicKeyPem);
+    try {
+      if (deps.credentials) {
+        const key = await deps.credentials.createControlChallenge(agent, digest, expiresAt);
+        keyId = key.keyId;
+      } else {
+        await deps.store.createChallenge({ agentId: agent.id, digest, expiresAt });
+      }
+    } catch (error) {
+      request.log.warn({ err: error }, 'agent challenge rejected');
+      return reply.code(409).send({ code: 'AGENT_CHALLENGE_REJECTED' });
+    }
     return {
       challenge,
-      signing_payload: agentControlMessage(agent.publicId, challenge),
+      signing_payload: agentControlMessage(agent.publicId, challenge, keyId),
+      key_id: keyId,
       algorithm: 'Ed25519',
       expires_at: expiresAt.toISOString(),
     };
@@ -216,15 +258,43 @@ export async function buildApp(deps: AppDependencies) {
     const agent = await deps.store.getAgent(agentId);
     if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
     if (!canManageAgent(principal, agent)) return reply.code(403).send({ code: 'TENANT_ACCESS_DENIED' });
+    if (agent.status === 'suspended' || agent.status === 'revoked') {
+      return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_CONTROL_VERIFICATION', status: agent.status });
+    }
     const body = verifyControlSchema.safeParse(request.body);
     if (!body.success) return reply.code(400).send({ code: 'VALIDATION_ERROR' });
-    if (!verifyAgentControlSignature(agent.publicKeyPem, agent.publicId, body.data.challenge, body.data.signature)) {
+    let publicKeyPem = agent.publicKeyPem;
+    let keyId = agentKeyId(agent.publicKeyPem);
+    try {
+      if (deps.credentials) {
+        const key = await deps.credentials.getCurrentKey(agent);
+        publicKeyPem = key.publicKeyPem;
+        keyId = key.keyId;
+      }
+    } catch {
+      return reply.code(409).send({ code: 'ACTIVE_AGENT_KEY_NOT_FOUND' });
+    }
+    if (!verifyAgentControlSignature(publicKeyPem, agent.publicId, body.data.challenge, body.data.signature, keyId)) {
       return reply.code(401).send({ code: 'INVALID_AGENT_SIGNATURE' });
     }
-    const confirmed = await deps.store.confirmAgentControl(agent, challengeDigest(body.data.challenge), new Date());
-    if (!confirmed) return reply.code(401).send({ code: 'INVALID_EXPIRED_OR_REPLAYED_CHALLENGE' });
-    return { verified: true, verification_level: 1 };
+    const digest = challengeDigest(body.data.challenge);
+    const confirmed = deps.credentials
+      ? await deps.credentials.confirmAgentControl(agent, keyId, digest, new Date())
+      : await deps.store.confirmAgentControl(agent, digest, new Date());
+    if (!confirmed) return reply.code(401).send({ code: 'INVALID_EXPIRED_REPLAYED_OR_STALE_CHALLENGE' });
+    return { verified: true, verification_level: 1, key_id: keyId };
   });
+
+  if (deps.credentials) {
+    registerCredentialRoutes({
+      app,
+      store: deps.store,
+      credentials: deps.credentials,
+      signer: deps.signer,
+      authenticate: deps.authenticate,
+      passportTtlDays: deps.config.passportTtlDays,
+    });
+  }
 
   app.post('/v1/agents/:agentId/passport-checkout', async (request, reply) => {
     const principal = await principalOrReply(request, reply);
@@ -233,6 +303,9 @@ export async function buildApp(deps: AppDependencies) {
     const agent = await deps.store.getAgent(agentId);
     if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
     if (!canManageAgent(principal, agent)) return reply.code(403).send({ code: 'TENANT_ACCESS_DENIED' });
+    if (agent.status === 'suspended' || agent.status === 'revoked') {
+      return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_PASSPORT', status: agent.status });
+    }
     if (agent.verificationLevel < 1 || !agent.controlVerifiedAt) return reply.code(409).send({ code: 'AGENT_CONTROL_NOT_VERIFIED' });
     const activePassport = await deps.store.getActivePassportForAgent(agent.id);
     if (activePassport) {
@@ -301,6 +374,9 @@ export async function buildApp(deps: AppDependencies) {
       if (session.amountMinor !== deps.config.passportPriceMinor) return reply.code(409).send({ code: 'PAYMENT_PRICE_POLICY_MISMATCH' });
       const agent = await deps.store.getAgent(event.agent_id);
       if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
+      if (agent.status === 'suspended' || agent.status === 'revoked') {
+        return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_PASSPORT', status: agent.status });
+      }
       if (agent.verificationLevel < 1 || !agent.controlVerifiedAt) return reply.code(409).send({ code: 'AGENT_CONTROL_NOT_VERIFIED' });
       const passport = deps.signer.issue(agent, deps.config.passportTtlDays);
       const ledgerEntries = passportSaleEntries(deps.config.passportPriceMinor, deps.config.referralCommissionMinor, agent.referrerAgentId);
@@ -422,7 +498,7 @@ export async function buildApp(deps: AppDependencies) {
   app.get('/.well-known/agent-card.json', async () => ({
     name: 'CREDALYX Agent Passport Network',
     description: 'Cryptographic agent identity, passport status and trust verification service.',
-    version: '0.3.0',
+    version: '0.4.0',
     supportedInterfaces: [{
       url: `${deps.config.publicBaseUrl.replace(/\/$/, '')}/a2a`,
       protocolBinding: 'HTTP+JSON',
@@ -441,7 +517,12 @@ export async function buildApp(deps: AppDependencies) {
     }],
   }));
 
-  app.addHook('onClose', async () => deps.store.close());
+  app.addHook('onClose', async () => {
+    await Promise.all([
+      deps.store.close(),
+      deps.credentials?.close() ?? Promise.resolve(),
+    ]);
+  });
   return app;
 }
 
@@ -509,7 +590,8 @@ async function startServer(): Promise<void> {
     audience: config.AUTH_JWT_AUDIENCE,
   });
   const app = await buildApp({
-    store: new PostgresPlatformStore(config.DATABASE_URL),
+    store: new PostgresLifecyclePlatformStore(config.DATABASE_URL),
+    credentials: new PostgresCredentialLifecycleStore(config.DATABASE_URL),
     signer,
     authenticate,
     paymentProvider: new SandboxPaymentProvider(),

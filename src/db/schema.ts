@@ -80,12 +80,16 @@ export const agentKeys = pgTable('agent_keys', {
   keyId: text('key_id').notNull(),
   algorithm: text('algorithm').notNull(),
   publicKeyPem: text('public_key_pem').notNull(),
+  activatedAt: timestamptz('activated_at').notNull().defaultNow(),
   createdAt: timestamptz('created_at').notNull().defaultNow(),
   expiresAt: timestamptz('expires_at'),
   revokedAt: timestamptz('revoked_at'),
 }, (table) => [
   uniqueIndex('agent_keys_agent_key_unique').on(table.agentId, table.keyId),
   index('agent_keys_active_idx').on(table.agentId, table.revokedAt),
+  uniqueIndex('agent_keys_one_active_per_agent')
+    .on(table.agentId)
+    .where(sql`${table.activatedAt} is not null and ${table.revokedAt} is null`),
 ]);
 
 export const agentEndpoints = pgTable('agent_endpoints', {
@@ -109,17 +113,40 @@ export const agentCapabilities = pgTable('agent_capabilities', {
 export const agentChallenges = pgTable('agent_challenges', {
   id: uuid('id').primaryKey(),
   agentId: uuid('agent_id').notNull().references(() => agents.id),
+  agentKeyId: uuid('agent_key_id').references(() => agentKeys.id),
   digest: text('digest').notNull(),
   expiresAt: timestamptz('expires_at').notNull(),
   consumedAt: timestamptz('consumed_at'),
   createdAt: timestamptz('created_at').notNull().defaultNow(),
-}, (table) => [index('agent_challenges_lookup_idx').on(table.agentId, table.digest, table.expiresAt)]);
+}, (table) => [
+  index('agent_challenges_lookup_idx').on(table.agentId, table.digest, table.expiresAt),
+  index('agent_challenges_key_idx').on(table.agentKeyId, table.expiresAt),
+]);
+
+export const agentKeyRotations = pgTable('agent_key_rotations', {
+  id: uuid('id').primaryKey(),
+  agentId: uuid('agent_id').notNull().references(() => agents.id),
+  oldKeyId: uuid('old_key_id').notNull().references(() => agentKeys.id),
+  newKeyFingerprint: text('new_key_fingerprint').notNull(),
+  newPublicKeyPem: text('new_public_key_pem').notNull(),
+  challengeDigest: text('challenge_digest').notNull(),
+  expiresAt: timestamptz('expires_at').notNull(),
+  completedAt: timestamptz('completed_at'),
+  cancelledAt: timestamptz('cancelled_at'),
+  createdAt: timestamptz('created_at').notNull().defaultNow(),
+}, (table) => [
+  index('agent_key_rotations_agent_idx').on(table.agentId, table.createdAt),
+  uniqueIndex('agent_key_rotations_one_pending_per_agent')
+    .on(table.agentId)
+    .where(sql`${table.completedAt} is null and ${table.cancelledAt} is null`),
+]);
 
 export const agentPassports = pgTable('agent_passports', {
   id: uuid('id').primaryKey(),
   passportId: text('passport_id').notNull().unique(),
   agentId: uuid('agent_id').notNull().references(() => agents.id),
   purchaseId: uuid('purchase_id').references(() => purchases.id),
+  passportVersion: integer('passport_version').notNull().default(1),
   schemaVersion: text('schema_version').notNull(),
   claims: jsonb('claims').notNull(),
   signature: text('signature').notNull(),
@@ -128,7 +155,11 @@ export const agentPassports = pgTable('agent_passports', {
   expiresAt: timestamptz('expires_at').notNull(),
   createdAt: timestamptz('created_at').notNull().defaultNow(),
 }, (table) => [
-  uniqueIndex('agent_passports_purchase_unique').on(table.purchaseId).where(sql`${table.purchaseId} is not null`),
+  index('agent_passports_purchase_idx').on(table.purchaseId),
+  uniqueIndex('agent_passports_purchase_version_unique')
+    .on(table.purchaseId, table.passportVersion)
+    .where(sql`${table.purchaseId} is not null`),
+  check('agent_passports_version_positive', sql`${table.passportVersion} > 0`),
 ]);
 
 export const passportStatusHistory = pgTable('passport_status_history', {
