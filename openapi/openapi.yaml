@@ -1,12 +1,12 @@
 openapi: 3.1.0
 info:
   title: CREDALYX Agent Passport API
-  version: 0.4.0
+  version: 0.5.0
   description: |
-    API for registering AI agents, proving control of versioned Ed25519 keys, rotating and revoking
-    agent keys, creating provider checkout sessions, issuing/reissuing and verifying internal
-    CREDALYX Agent Passports, and exposing referral-ledger wallet views. Agent Passports are not
-    government identity documents, licences, KYC results, regulatory approvals, or stored-value bank accounts.
+    API for agent registration/control, versioned agent keys, hosted passport checkout,
+    signed CREDALYX Agent Passports, issuer verification-key discovery, referral wallet
+    views and payment reversals. Agent Passports are private-sector software credentials,
+    not government identity documents, licences, KYC results or regulatory approvals.
 servers:
   - url: https://api.example.invalid
 security:
@@ -18,6 +18,50 @@ paths:
       responses:
         '200': { description: Healthy }
 
+  /.well-known/agent-card.json:
+    get:
+      security: []
+      summary: A2A Protocol v1.0 discovery card
+      responses:
+        '200': { description: A2A Agent Card }
+
+  /.well-known/agent-passport-issuer.json:
+    get:
+      security: []
+      summary: Discover Agent Passport issuer metadata
+      responses:
+        '200':
+          description: Issuer metadata including current signing key and JWKS URI
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuerMetadata' }
+
+  /.well-known/jwks.json:
+    get:
+      security: []
+      summary: Fetch active and retired non-revoked issuer verification keys
+      description: Private JWK parameters are never exposed. Revoked issuer keys are excluded.
+      responses:
+        '200':
+          description: Public Ed25519 verification keys
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Jwks' }
+
+  /v1/issuer/keys/{issuer_key_id}:
+    parameters:
+      - $ref: '#/components/parameters/IssuerKeyId'
+    get:
+      security: []
+      summary: Resolve an exact issuer verification key and live status
+      responses:
+        '200':
+          description: Issuer public key descriptor
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuerKey' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/agents:
     post:
       summary: Register an agent
@@ -27,17 +71,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/CreateAgentRequest' }
       responses:
-        '201':
-          description: Agent registered
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [agent_id, verification_level, referral_code]
-                properties:
-                  agent_id: { type: string }
-                  verification_level: { const: 0 }
-                  referral_code: { type: string }
+        '201': { description: Agent registered }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { description: Registration or referral conflict }
@@ -49,11 +83,7 @@ paths:
       security: []
       summary: Read public agent registry data
       responses:
-        '200':
-          description: Public agent record
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/PublicAgent' }
+        '200': { description: Public agent record }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/agents/{agent_id}/keys/current:
@@ -61,7 +91,7 @@ paths:
       - $ref: '#/components/parameters/AgentId'
     get:
       security: []
-      summary: Resolve the current active agent verification key
+      summary: Resolve the current active agent key
       responses:
         '200':
           description: Current Ed25519 key
@@ -73,16 +103,13 @@ paths:
   /v1/agents/{agent_id}/keys/{key_id}:
     parameters:
       - $ref: '#/components/parameters/AgentId'
-      - $ref: '#/components/parameters/KeyId'
+      - $ref: '#/components/parameters/AgentKeyId'
     get:
       security: []
-      summary: Resolve an exact current or historical agent verification key
-      description: |
-        Key identifiers are deterministic SHA-256 fingerprints of Ed25519 SPKI public-key material.
-        Historical revoked keys remain resolvable so a passport can never silently resolve against a newer key.
+      summary: Resolve an exact current or historical agent key
       responses:
         '200':
-          description: Exact key version
+          description: Historical key descriptor
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HistoricalAgentKey' }
@@ -92,30 +119,18 @@ paths:
     parameters:
       - $ref: '#/components/parameters/AgentId'
     post:
-      summary: Create a one-time agent-control challenge bound to the current key
+      summary: Create a key-bound one-time agent-control challenge
       responses:
-        '200':
-          description: Challenge and exact signing payload
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [challenge, signing_payload, key_id, algorithm, expires_at]
-                properties:
-                  challenge: { type: string }
-                  signing_payload: { type: string }
-                  key_id: { type: string }
-                  algorithm: { const: Ed25519 }
-                  expires_at: { type: string, format: date-time }
+        '200': { description: Challenge, exact signing payload and bound key ID }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { description: No active key or challenge creation rejected }
+        '409': { description: Agent/key not eligible }
 
   /v1/agents/{agent_id}/verify-control:
     parameters:
       - $ref: '#/components/parameters/AgentId'
     post:
-      summary: Verify Ed25519 proof of possession of the challenge-bound active key
+      summary: Verify Ed25519 proof of possession
       requestBody:
         required: true
         content:
@@ -126,85 +141,19 @@ paths:
               required: [challenge, signature]
               properties:
                 challenge: { type: string }
-                signature:
-                  type: string
-                  description: Base64url Ed25519 signature over signing_payload from the challenge response.
+                signature: { type: string, description: Base64url Ed25519 signature over the returned signing_payload }
       responses:
-        '200':
-          description: Control verified
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [verified, verification_level, key_id]
-                properties:
-                  verified: { const: true }
-                  verification_level: { const: 1 }
-                  key_id: { type: string }
-        '401': { description: Invalid signature, expired/replayed challenge, or stale key binding }
+        '200': { description: Level 1 control verified }
+        '401': { description: Invalid, expired, replayed or stale-key proof }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { description: No active key }
+        '409': { description: Agent/key not eligible }
 
   /v1/agents/{agent_id}/keys/rotation-challenge:
     parameters:
       - $ref: '#/components/parameters/AgentId'
     post:
-      summary: Start dual-proof Ed25519 key rotation
-      description: |
-        Creates one pending rotation. The returned signing_payload must be signed by both the current
-        active private key and the proposed new private key. Private keys are never submitted to CREDALYX.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/StartKeyRotationRequest' }
-      responses:
-        '201':
-          description: Rotation challenge created
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/KeyRotationChallenge' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { description: Rotation already pending, same key supplied, or no active key }
-
-  /v1/agents/{agent_id}/keys/rotation-complete:
-    parameters:
-      - $ref: '#/components/parameters/AgentId'
-    post:
-      summary: Complete a dual-proof key rotation atomically
-      description: |
-        Both signatures must verify over the exact rotation signing_payload. If the agent has an active
-        paid passport, CREDALYX revokes the old passport and reissues the next passport version referencing
-        the new key without a second payment and without extending the original expiry.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CompleteKeyRotationRequest' }
-      responses:
-        '200':
-          description: Key rotated and passport reissued when applicable
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/KeyRotationResult' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { description: Rotation expired, challenge mismatch, or either signature invalid }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { description: Rotation no longer pending or transactional precondition changed }
-
-  /v1/agents/{agent_id}/keys/{key_id}/revoke:
-    parameters:
-      - $ref: '#/components/parameters/AgentId'
-      - $ref: '#/components/parameters/KeyId'
-    post:
-      summary: Emergency revoke an agent verification key
-      description: |
-        Revoking the current active key suspends the agent and revokes active passports. This endpoint
-        intentionally does not install a replacement key; account recovery is a separate high-assurance flow.
+      summary: Start dual-proof agent key rotation
       requestBody:
         required: true
         content:
@@ -212,22 +161,55 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [reason_code]
+              required: [new_public_key_pem]
               properties:
-                reason_code: { type: string, minLength: 3, maxLength: 128 }
+                new_public_key_pem: { type: string }
       responses:
-        '200':
-          description: Revocation result
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [revoked, key_id, agent_suspended, passport_revoked]
-                properties:
-                  revoked: { type: boolean }
-                  key_id: { type: string }
-                  agent_suspended: { type: boolean }
-                  passport_revoked: { type: boolean }
+        '201': { description: Rotation challenge requiring old-key and new-key signatures }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Rotation rejected or already pending }
+
+  /v1/agents/{agent_id}/keys/rotation-complete:
+    parameters:
+      - $ref: '#/components/parameters/AgentId'
+    post:
+      summary: Complete dual-proof key rotation atomically
+      description: An active paid passport is reissued without a second payment and without extending expiry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [rotation_id, challenge, current_key_signature, new_key_signature]
+              properties:
+                rotation_id: { type: string, format: uuid }
+                challenge: { type: string }
+                current_key_signature: { type: string }
+                new_key_signature: { type: string }
+      responses:
+        '200': { description: Key rotated; passport reissued when applicable }
+        '401': { description: Challenge/signature validation failed }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Transactional rotation precondition failed }
+
+  /v1/agents/{agent_id}/keys/{key_id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/AgentId'
+      - $ref: '#/components/parameters/AgentKeyId'
+    post:
+      summary: Emergency revoke an agent key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReasonRequest' }
+      responses:
+        '200': { description: Key revoked; current-key revocation suspends agent and revokes active passport }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -237,75 +219,48 @@ paths:
       - $ref: '#/components/parameters/AgentId'
       - $ref: '#/components/parameters/IdempotencyKey'
     post:
-      summary: Create a hosted checkout session for an Agent Passport
-      description: |
-        The server selects the configured price and currency. Frontend-provided prices are not accepted.
-        A successful payment webhook must correlate back to this persisted checkout before a passport can issue.
+      summary: Create hosted Agent Passport checkout
+      description: Price and currency are selected server-side and correlated to the future signed payment event.
       responses:
         '201':
-          description: Checkout created or idempotently returned
+          description: Checkout session
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CheckoutSession' }
-        '400': { description: Missing/invalid idempotency key }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { description: Agent not verified, active passport exists, or idempotency conflict }
+        '409': { description: Agent not eligible, active passport exists or idempotency conflict }
 
   /v1/webhooks/payment-provider:
     post:
       security: []
       summary: Sandbox payment-provider webhook
-      description: |
-        Sandbox-only adapter. Production startup rejects this adapter. A production provider integration must
-        verify the provider's native signature over the required raw request representation before processing.
-      parameters:
-        - in: header
-          name: x-sandbox-timestamp
-          required: true
-          schema: { type: string }
-        - in: header
-          name: x-sandbox-signature
-          required: true
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              oneOf:
-                - $ref: '#/components/schemas/PaymentSucceededEvent'
-                - $ref: '#/components/schemas/PaymentReversalEvent'
-              discriminator:
-                propertyName: type
+      description: Production requires a provider-native signed webhook adapter; sandbox is rejected in production.
       responses:
-        '201': { description: Payment accepted and passport issued atomically with ledger posting }
-        '200': { description: Reversal processed or provider retry already handled }
-        '400': { description: Invalid event shape }
+        '201': { description: Payment accepted and passport issued atomically }
+        '200': { description: Reversal processed or duplicate event }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { description: Invalid webhook signature }
-        '404': { description: Checkout session or purchase not found }
-        '409': { description: Payment/session mismatch or finalization precondition failed }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Payment correlation/finalization rejected }
 
   /v1/wallet:
     get:
-      summary: Read the authenticated owner's referral wallet for one agent
+      summary: Read ledger-derived referral wallet
       parameters:
         - in: query
           name: agent_id
           required: true
           schema: { type: string }
       responses:
-        '200':
-          description: Ledger-derived wallet snapshot
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/WalletSnapshot' }
+        '200': { description: Pending/available/debt/paid/reversed snapshot }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/wallet/transactions:
     get:
-      summary: Read recent agent-scoped referral ledger entries
+      summary: Read recent agent-scoped ledger entries
       parameters:
         - in: query
           name: agent_id
@@ -313,21 +268,9 @@ paths:
           schema: { type: string }
         - in: query
           name: limit
-          required: false
           schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
       responses:
-        '200':
-          description: Recent sealed ledger entries. Cursor pagination is scheduled before production launch.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data, has_more]
-                properties:
-                  data:
-                    type: array
-                    items: { $ref: '#/components/schemas/WalletTransaction' }
-                  has_more: { type: boolean }
+        '200': { description: Recent sealed ledger entries }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
@@ -336,9 +279,13 @@ paths:
       - $ref: '#/components/parameters/PassportId'
     get:
       security: []
-      summary: Fetch a signed Agent Passport
+      summary: Fetch signed Agent Passport
       responses:
-        '200': { description: Signed passport claims, passport_version, signature and current status }
+        '200':
+          description: Passport claims, signature and live status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentPassport' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/passports/{passport_id}/status:
@@ -348,7 +295,7 @@ paths:
       security: []
       summary: Read live passport status
       responses:
-        '200': { description: Current status }
+        '200': { description: Current status and expiry }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/passports/{passport_id}/verify:
@@ -356,7 +303,7 @@ paths:
       - $ref: '#/components/parameters/PassportId'
     post:
       security: []
-      summary: Verify passport signature, issuer, expiry and live status
+      summary: Verify signature, issuer key, expiry and live passport status
       responses:
         '200':
           description: Verification result
@@ -364,11 +311,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [valid, status, agent_id]
+                required: [valid, status, agent_id, issuer_key_id]
                 properties:
                   valid: { type: boolean }
                   status: { type: string }
                   agent_id: { type: string }
+                  issuer_key_id:
+                    oneOf:
+                      - { type: string }
+                      - { type: 'null' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/passports/{passport_id}/revoke:
@@ -380,23 +331,11 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [reason_code]
-              properties:
-                reason_code: { type: string, minLength: 3, maxLength: 128 }
+            schema: { $ref: '#/components/schemas/ReasonRequest' }
       responses:
         '200': { description: Revoked }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-
-  /.well-known/agent-card.json:
-    get:
-      security: []
-      summary: A2A Protocol v1.0 discovery card
-      responses:
-        '200': { description: A2A Agent Card }
 
 components:
   securitySchemes:
@@ -411,13 +350,16 @@ components:
       name: agent_id
       required: true
       schema: { type: string }
-    KeyId:
+    AgentKeyId:
       in: path
       name: key_id
       required: true
-      schema:
-        type: string
-        pattern: '^key_ed25519_[A-Za-z0-9_-]+$'
+      schema: { type: string, pattern: '^key_ed25519_[A-Za-z0-9_-]+$' }
+    IssuerKeyId:
+      in: path
+      name: issuer_key_id
+      required: true
+      schema: { type: string, pattern: '^issuer_ed25519_[A-Za-z0-9_-]+$' }
     PassportId:
       in: path
       name: passport_id
@@ -427,40 +369,22 @@ components:
       in: header
       name: Idempotency-Key
       required: true
-      description: Client-generated key scoped to the authenticated owner and agent checkout intent.
       schema: { type: string, minLength: 16, maxLength: 128 }
 
   schemas:
-    MoneyMinorString:
-      type: string
-      pattern: '^-?[0-9]+$'
-      description: Integer monetary amount in the currency's minor unit, serialized as a decimal string.
-
     CreateAgentRequest:
       type: object
       additionalProperties: false
       required: [public_key_pem, endpoint]
       properties:
         organization_id: { type: string, format: uuid }
-        public_key_pem:
-          type: string
-          description: Ed25519 public key encoded as SPKI PEM.
+        public_key_pem: { type: string, description: Ed25519 SPKI PEM }
         endpoint: { type: string, format: uri }
         capabilities:
           type: array
           maxItems: 50
           items: { type: string, maxLength: 128 }
         referral_code: { type: string }
-
-    PublicAgent:
-      type: object
-      required: [agent_id, endpoint, capabilities, verification_level, status]
-      properties:
-        agent_id: { type: string }
-        endpoint: { type: string, format: uri }
-        capabilities: { type: array, items: { type: string } }
-        verification_level: { type: integer, minimum: 0, maximum: 3 }
-        status: { enum: [pending, active, suspended, revoked] }
 
     AgentKey:
       type: object
@@ -484,68 +408,94 @@ components:
                 - { type: 'null' }
             active: { type: boolean }
 
-    StartKeyRotationRequest:
+    PublicJwk:
       type: object
       additionalProperties: false
-      required: [new_public_key_pem]
+      required: [kty, crv, x, kid, alg, use]
       properties:
-        new_public_key_pem:
-          type: string
-          description: Proposed Ed25519 public key encoded as SPKI PEM.
+        kty: { const: OKP }
+        crv: { const: Ed25519 }
+        x: { type: string }
+        kid: { type: string }
+        alg: { const: EdDSA }
+        use: { const: sig }
 
-    KeyRotationChallenge:
+    Jwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items: { $ref: '#/components/schemas/PublicJwk' }
+
+    IssuerMetadata:
+      type: object
+      required: [issuer, credential_type, schema_versions, signing_algorithms, active_key_id, jwks_uri, key_uri_template, status]
+      properties:
+        issuer: { type: string, format: uri }
+        credential_type: { const: CREDALYX Agent Passport }
+        schema_versions:
+          type: array
+          items: { enum: ['1.0', '1.1'] }
+        signing_algorithms:
+          type: array
+          items: { const: EdDSA }
+        active_key_id: { type: string }
+        jwks_uri: { type: string, format: uri }
+        key_uri_template: { type: string }
+        status: { const: operational }
+
+    IssuerKey:
+      type: object
+      required: [key_id, algorithm, public_key_pem, public_jwk, status, provider, activated_at, retired_at, revoked_at]
+      properties:
+        key_id: { type: string }
+        algorithm: { const: Ed25519 }
+        public_key_pem: { type: string }
+        public_jwk: { $ref: '#/components/schemas/PublicJwk' }
+        status: { enum: [active, retired, revoked] }
+        provider: { type: string }
+        activated_at: { type: string, format: date-time }
+        retired_at:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        revoked_at:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+
+    AgentPassport:
       type: object
       required:
-        - rotation_id
-        - challenge
-        - signing_payload
-        - old_key_id
-        - new_key_id
-        - algorithm
-        - required_signatures
+        - passport_id
+        - passport_version
+        - agent_id
+        - issuer
+        - subject
+        - verification_level
+        - capabilities
+        - issued_at
         - expires_at
+        - public_key_reference
+        - status_reference
+        - schema_version
+        - signature
+        - status
       properties:
-        rotation_id: { type: string, format: uuid }
-        challenge: { type: string }
-        signing_payload: { type: string }
-        old_key_id: { type: string }
-        new_key_id: { type: string }
-        algorithm: { const: Ed25519 }
-        required_signatures:
-          type: array
-          prefixItems:
-            - { const: current_key }
-            - { const: new_key }
-          minItems: 2
-          maxItems: 2
-        expires_at: { type: string, format: date-time }
-
-    CompleteKeyRotationRequest:
-      type: object
-      additionalProperties: false
-      required: [rotation_id, challenge, current_key_signature, new_key_signature]
-      properties:
-        rotation_id: { type: string, format: uuid }
-        challenge: { type: string }
-        current_key_signature:
-          type: string
-          description: Base64url Ed25519 signature by the current key over the exact signing_payload.
-        new_key_signature:
-          type: string
-          description: Base64url Ed25519 signature by the proposed new key over the exact signing_payload.
-
-    KeyRotationResult:
-      type: object
-      required: [rotated, agent_id, old_key_id, new_key_id, reissued_passport_id]
-      properties:
-        rotated: { const: true }
+        passport_id: { type: string }
+        passport_version: { type: integer, minimum: 1 }
         agent_id: { type: string }
-        old_key_id: { type: string }
-        new_key_id: { type: string }
-        reissued_passport_id:
-          oneOf:
-            - { type: string }
-            - { type: 'null' }
+        issuer: { type: string, format: uri }
+        issuer_key_id:
+          description: Required for schema 1.1; absent on legacy schema 1.0 credentials.
+          type: string
+        subject: { type: string }
+        verification_level: { type: integer, minimum: 0, maximum: 3 }
+        capabilities: { type: array, items: { type: string } }
+        issued_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        public_key_reference: { type: string, format: uri }
+        status_reference: { type: string, format: uri }
+        schema_version: { enum: ['1.0', '1.1'] }
+        signature: { type: string }
+        status: { enum: [active, suspended, revoked, expired] }
 
     CheckoutSession:
       type: object
@@ -554,71 +504,18 @@ components:
         purchase_id: { type: string }
         provider: { type: string }
         checkout_url: { type: string, format: uri }
-        amount_minor: { $ref: '#/components/schemas/MoneyMinorString' }
+        amount_minor: { type: string, pattern: '^[0-9]+$' }
         currency: { const: USD }
         expires_at: { type: string, format: date-time }
 
-    PaymentSucceededEvent:
+    ReasonRequest:
       type: object
       additionalProperties: false
-      required: [event_id, type, purchase_id, agent_id, amount_minor, currency]
+      required: [reason_code]
       properties:
-        event_id: { type: string }
-        type: { const: payment.succeeded }
-        purchase_id: { type: string }
-        agent_id: { type: string }
-        amount_minor: { type: integer, minimum: 1 }
-        currency: { const: USD }
-
-    PaymentReversalEvent:
-      type: object
-      additionalProperties: false
-      required: [event_id, type, purchase_id, amount_minor, currency, reason_code]
-      properties:
-        event_id: { type: string }
-        type: { enum: [payment.refunded, payment.chargeback] }
-        purchase_id: { type: string }
-        amount_minor: { type: integer, minimum: 1 }
-        currency: { const: USD }
         reason_code: { type: string, minLength: 3, maxLength: 128 }
 
-    WalletSnapshot:
-      type: object
-      required:
-        - currency
-        - pending_minor
-        - available_minor
-        - debt_minor
-        - paid_minor
-        - reversed_minor
-        - min_payout_minor
-        - payout_eligible
-      properties:
-        currency: { const: USD }
-        pending_minor: { $ref: '#/components/schemas/MoneyMinorString' }
-        available_minor: { $ref: '#/components/schemas/MoneyMinorString' }
-        debt_minor: { $ref: '#/components/schemas/MoneyMinorString' }
-        paid_minor: { $ref: '#/components/schemas/MoneyMinorString' }
-        reversed_minor: { $ref: '#/components/schemas/MoneyMinorString' }
-        min_payout_minor: { $ref: '#/components/schemas/MoneyMinorString' }
-        payout_eligible: { type: boolean }
-
-    WalletTransaction:
-      type: object
-      required: [transaction_id, transaction_type, external_reference, created_at, account, amount_minor, currency]
-      properties:
-        transaction_id: { type: string, format: uuid }
-        transaction_type: { type: string }
-        external_reference: { type: string }
-        created_at: { type: string, format: date-time }
-        account: { type: string }
-        amount_minor: { $ref: '#/components/schemas/MoneyMinorString' }
-        currency: { const: USD }
-
   responses:
-    BadRequest:
-      description: Invalid input
-    Forbidden:
-      description: Authenticated principal cannot access the tenant/resource
-    NotFound:
-      description: Resource not found
+    BadRequest: { description: Invalid input }
+    Forbidden: { description: Authenticated principal cannot access the tenant/resource }
+    NotFound: { description: Resource not found }
