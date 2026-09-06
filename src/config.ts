@@ -11,6 +11,8 @@ const envSchema = z.object({
   MIN_PAYOUT_MINOR: z.coerce.number().int().positive().default(2500),
   PASSPORT_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   SANDBOX_WEBHOOK_SECRET: z.string().min(32),
+  PASSPORT_ISSUER_BACKEND: z.enum(['local-pem', 'managed']).default('local-pem'),
+  PASSPORT_ISSUER_KEY_REFERENCE: z.string().min(1).optional(),
   PASSPORT_ISSUER_PRIVATE_KEY_PEM: z.string().min(40).optional(),
   PASSPORT_ISSUER_PUBLIC_KEY_PEM: z.string().min(40).optional(),
   AUTH_JWT_PUBLIC_KEY_PEM: z.string().min(40).optional(),
@@ -29,10 +31,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   if (parsed.MIN_PAYOUT_MINOR < parsed.REFERRAL_COMMISSION_MINOR) {
     throw new Error('MIN_PAYOUT_MINOR must be at least one referral commission');
   }
+  if (Boolean(parsed.PASSPORT_ISSUER_PRIVATE_KEY_PEM) !== Boolean(parsed.PASSPORT_ISSUER_PUBLIC_KEY_PEM)) {
+    throw new Error('local issuer private/public PEM values must be configured together');
+  }
+  if (parsed.PASSPORT_ISSUER_BACKEND === 'managed' && !parsed.PASSPORT_ISSUER_KEY_REFERENCE) {
+    throw new Error('PASSPORT_ISSUER_KEY_REFERENCE is required for a managed issuer backend');
+  }
   if (parsed.NODE_ENV === 'production') {
     if (!parsed.DATABASE_URL) throw new Error('DATABASE_URL is required in production');
-    if (!parsed.PASSPORT_ISSUER_PRIVATE_KEY_PEM || !parsed.PASSPORT_ISSUER_PUBLIC_KEY_PEM) {
-      throw new Error('stable passport issuer keys are required in production');
+    if (parsed.PASSPORT_ISSUER_BACKEND !== 'managed') {
+      throw new Error('production requires a managed KMS/HSM-compatible passport issuer backend');
     }
     if (!parsed.AUTH_JWT_PUBLIC_KEY_PEM || !parsed.AUTH_JWT_ISSUER || !parsed.AUTH_JWT_AUDIENCE) {
       throw new Error('trusted JWT verification configuration is required in production');
