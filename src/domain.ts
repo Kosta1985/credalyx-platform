@@ -1,5 +1,5 @@
 import { generateKeyPairSync, sign, verify } from 'node:crypto';
-import { canonicalize, uuidv7 } from './crypto.js';
+import { agentKeyId, canonicalize, uuidv7 } from './crypto.js';
 
 export type Currency = 'USD';
 export type VerificationLevel = 0 | 1 | 2 | 3;
@@ -13,7 +13,6 @@ export interface AgentRecord {
   publicId: string;
   ownerSubject: string;
   organizationId?: string;
-  keyId: string;
   publicKeyPem: string;
   capabilities: string[];
   endpoint: string;
@@ -133,6 +132,7 @@ export class PassportSigner {
     const expires = preserveExpiresAt ?? new Date(issued.getTime() + ttlDays * 86_400_000);
     if (expires.getTime() <= issued.getTime()) throw new Error('passport expiry must be in the future');
     const passportId = uuidv7();
+    const keyId = agentKeyId(agent.publicKeyPem);
     const claims: AgentPassportClaims = {
       passport_id: passportId,
       passport_version: passportVersion,
@@ -143,7 +143,7 @@ export class PassportSigner {
       capabilities: [...agent.capabilities].sort(),
       issued_at: issued.toISOString(),
       expires_at: expires.toISOString(),
-      public_key_reference: `${this.issuer}/v1/agents/${agent.publicId}/keys/${encodeURIComponent(agent.keyId)}`,
+      public_key_reference: `${this.issuer}/v1/agents/${agent.publicId}/keys/${encodeURIComponent(keyId)}`,
       status_reference: `${this.issuer}/v1/passports/${passportId}/status`,
       schema_version: '1.0',
     };
