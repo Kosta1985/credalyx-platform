@@ -8,7 +8,7 @@ import {
   keyRotationMessage,
   verifyEd25519Signature,
 } from '../crypto.js';
-import { PassportSigner, type AgentRecord } from '../domain.js';
+import type { AgentRecord, SignedPassport } from '../domain.js';
 import type { PlatformStore } from '../store.js';
 import type { CredentialLifecycleStore } from './store.js';
 
@@ -16,7 +16,12 @@ export interface CredentialRouteDependencies {
   app: FastifyInstance;
   store: PlatformStore;
   credentials: CredentialLifecycleStore;
-  signer: PassportSigner;
+  issuePassport: (
+    agent: AgentRecord,
+    ttlDays: number,
+    passportVersion: number,
+    preserveExpiresAt?: Date,
+  ) => Promise<SignedPassport>;
   authenticate: Authenticator;
   passportTtlDays: number;
 }
@@ -79,6 +84,9 @@ export function registerCredentialRoutes(deps: CredentialRouteDependencies): voi
     const agent = await deps.store.getAgent(agentId);
     if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
     if (!canManageAgent(principal, agent)) return reply.code(403).send({ code: 'TENANT_ACCESS_DENIED' });
+    if (agent.status === 'suspended' || agent.status === 'revoked') {
+      return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_KEY_ROTATION', status: agent.status });
+    }
     const parsed = startRotationSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ code: 'VALIDATION_ERROR', details: parsed.error.flatten() });
     try {
@@ -121,6 +129,9 @@ export function registerCredentialRoutes(deps: CredentialRouteDependencies): voi
     const agent = await deps.store.getAgent(agentId);
     if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
     if (!canManageAgent(principal, agent)) return reply.code(403).send({ code: 'TENANT_ACCESS_DENIED' });
+    if (agent.status === 'suspended' || agent.status === 'revoked') {
+      return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_KEY_ROTATION', status: agent.status });
+    }
     const parsed = completeRotationSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ code: 'VALIDATION_ERROR', details: parsed.error.flatten() });
     const rotation = await deps.credentials.getKeyRotation(agent, parsed.data.rotation_id);
@@ -145,10 +156,10 @@ export function registerCredentialRoutes(deps: CredentialRouteDependencies): voi
     }
 
     const activePassport = await deps.store.getActivePassportForAgent(agent.id);
-    let replacementPassport;
+    let replacementPassport: SignedPassport | undefined;
     if (activePassport) {
       const currentVersion = activePassport.claims.passport_version ?? 1;
-      replacementPassport = deps.signer.issue(
+      replacementPassport = await deps.issuePassport(
         { ...agent, publicKeyPem: rotation.newPublicKeyPem },
         deps.passportTtlDays,
         currentVersion + 1,
