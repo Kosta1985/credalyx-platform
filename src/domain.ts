@@ -1,20 +1,25 @@
-import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign, verify } from 'node:crypto';
+import { generateKeyPairSync, sign, verify } from 'node:crypto';
+import { canonicalize, uuidv7 } from './crypto.js';
 
 export type Currency = 'USD';
 export type VerificationLevel = 0 | 1 | 2 | 3;
+export type AgentStatus = 'pending' | 'active' | 'suspended' | 'revoked';
 export type PassportStatus = 'active' | 'suspended' | 'revoked' | 'expired';
 
 export interface AgentRecord {
   id: string;
   publicId: string;
-  ownerId: string;
+  ownerSubject: string;
   organizationId?: string;
   publicKeyPem: string;
   capabilities: string[];
   endpoint: string;
   verificationLevel: VerificationLevel;
+  status: AgentStatus;
   controlVerifiedAt?: string;
   referrerAgentId?: string;
+  referralCode: string;
+  version: number;
 }
 
 export interface AgentPassportClaims {
@@ -51,6 +56,8 @@ export type LedgerAccount =
 
 export interface LedgerEntry {
   account: LedgerAccount;
+  scopeType: 'platform' | 'agent';
+  scopeId: string;
   amountMinor: bigint;
   currency: Currency;
 }
@@ -63,6 +70,15 @@ export interface LedgerTransaction {
   entries: readonly LedgerEntry[];
 }
 
+export function assertBalancedEntries(entries: readonly LedgerEntry[]): void {
+  if (entries.length < 2) throw new Error('ledger transaction requires at least two entries');
+  const totals = new Map<Currency, bigint>();
+  for (const entry of entries) totals.set(entry.currency, (totals.get(entry.currency) ?? 0n) + entry.amountMinor);
+  for (const [currency, total] of totals) {
+    if (total !== 0n) throw new Error(`unbalanced ledger transaction for ${currency}`);
+  }
+}
+
 export class Ledger {
   readonly transactions: LedgerTransaction[] = [];
   private readonly idempotency = new Map<string, LedgerTransaction>();
@@ -70,19 +86,10 @@ export class Ledger {
   post(input: Omit<LedgerTransaction, 'id' | 'createdAt'>): LedgerTransaction {
     const existing = this.idempotency.get(input.idempotencyKey);
     if (existing) return existing;
-    if (input.entries.length < 2) throw new Error('ledger transaction requires at least two entries');
-
-    const totals = new Map<Currency, bigint>();
-    for (const entry of input.entries) {
-      totals.set(entry.currency, (totals.get(entry.currency) ?? 0n) + entry.amountMinor);
-    }
-    for (const [currency, total] of totals) {
-      if (total !== 0n) throw new Error(`unbalanced ledger transaction for ${currency}`);
-    }
-
+    assertBalancedEntries(input.entries);
     const tx: LedgerTransaction = {
       ...input,
-      id: randomUUID(),
+      id: uuidv7(),
       createdAt: new Date().toISOString(),
       entries: Object.freeze([...input.entries]),
     };
@@ -95,40 +102,52 @@ export class Ledger {
 export class PassportSigner {
   readonly publicKeyPem: string;
   private readonly privateKeyPem: string;
+  readonly issuer: string;
 
-  constructor() {
+  constructor(input: { privateKeyPem: string; publicKeyPem: string; issuer: string }) {
+    this.privateKeyPem = input.privateKeyPem;
+    this.publicKeyPem = input.publicKeyPem;
+    this.issuer = input.issuer.replace(/\/$/, '');
+  }
+
+  static ephemeral(issuer = 'https://credalyx.example'): PassportSigner {
     const pair = generateKeyPairSync('ed25519');
-    this.publicKeyPem = pair.publicKey.export({ format: 'pem', type: 'spki' }).toString();
-    this.privateKeyPem = pair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+    return new PassportSigner({
+      issuer,
+      publicKeyPem: pair.publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+      privateKeyPem: pair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
+    });
   }
 
   issue(agent: AgentRecord, ttlDays = 30): SignedPassport {
     if (agent.verificationLevel < 1 || !agent.controlVerifiedAt) {
       throw new Error('agent control must be verified before passport issuance');
     }
+    if (agent.status === 'revoked' || agent.status === 'suspended') throw new Error('agent is not eligible for passport issuance');
     const issued = new Date();
     const expires = new Date(issued.getTime() + ttlDays * 86_400_000);
+    const passportId = uuidv7();
     const claims: AgentPassportClaims = {
-      passport_id: randomUUID(),
+      passport_id: passportId,
       agent_id: agent.publicId,
-      issuer: 'https://credalyx.example',
+      issuer: this.issuer,
       subject: `agent:${agent.publicId}`,
       verification_level: agent.verificationLevel,
       capabilities: [...agent.capabilities].sort(),
       issued_at: issued.toISOString(),
       expires_at: expires.toISOString(),
-      public_key_reference: `${agent.publicId}#primary`,
-      status_reference: `https://credalyx.example/v1/passports/status/${agent.publicId}`,
+      public_key_reference: `${this.issuer}/v1/agents/${agent.publicId}/keys/current`,
+      status_reference: `${this.issuer}/v1/passports/${passportId}/status`,
       schema_version: '1.0',
     };
-    const payload = canonicalize(claims);
-    const signature = sign(null, Buffer.from(payload), this.privateKeyPem).toString('base64url');
+    const signature = sign(null, Buffer.from(canonicalize(claims)), this.privateKeyPem).toString('base64url');
     return { claims, signature, status: 'active' };
   }
 
-  verify(passport: SignedPassport): boolean {
+  verify(passport: SignedPassport, nowMs = Date.now()): boolean {
     if (passport.status !== 'active') return false;
-    if (Date.parse(passport.claims.expires_at) <= Date.now()) return false;
+    if (Date.parse(passport.claims.expires_at) <= nowMs) return false;
+    if (passport.claims.issuer !== this.issuer) return false;
     return verify(
       null,
       Buffer.from(canonicalize(passport.claims)),
@@ -138,68 +157,46 @@ export class PassportSigner {
   }
 }
 
-export class ChallengeService {
-  private readonly challenges = new Map<string, { digest: string; expiresAt: number; consumed: boolean }>();
-
-  create(agentId: string, ttlMs = 120_000): string {
-    const challenge = randomBytes(32).toString('base64url');
-    this.challenges.set(agentId, {
-      digest: createHash('sha256').update(challenge).digest('hex'),
-      expiresAt: Date.now() + ttlMs,
-      consumed: false,
-    });
-    return challenge;
-  }
-
-  consume(agentId: string, challenge: string): boolean {
-    const record = this.challenges.get(agentId);
-    if (!record || record.consumed || record.expiresAt <= Date.now()) return false;
-    const digest = createHash('sha256').update(challenge).digest('hex');
-    if (digest !== record.digest) return false;
-    record.consumed = true;
-    return true;
-  }
+export function assertReferralAllowed(input: {
+  newAgentPublicId: string;
+  ownerSubject: string;
+  referrer?: Pick<AgentRecord, 'publicId' | 'ownerSubject'>;
+}): void {
+  if (!input.referrer) return;
+  if (input.newAgentPublicId === input.referrer.publicId) throw new Error('self-referral is forbidden');
+  if (input.ownerSubject === input.referrer.ownerSubject) throw new Error('self-referral by common owner is forbidden');
 }
 
-export function assertReferralAllowed(agentId: string, referrerAgentId?: string): void {
-  if (!referrerAgentId) return;
-  if (agentId === referrerAgentId) throw new Error('self-referral is forbidden');
-}
-
-export function recordPassportSale(
-  ledger: Ledger,
-  purchaseId: string,
-  priceMinor: bigint,
-  referralCommissionMinor: bigint,
-  hasReferrer: boolean,
-): LedgerTransaction {
+export function passportSaleEntries(priceMinor: bigint, referralCommissionMinor: bigint, referrerAgentId?: string): LedgerEntry[] {
   if (priceMinor <= 0n) throw new Error('price must be positive');
   if (referralCommissionMinor < 0n) throw new Error('commission cannot be negative');
-  if (hasReferrer && referralCommissionMinor >= priceMinor) {
-    throw new Error('commission must leave positive gross revenue before fees/taxes');
-  }
+  if (referrerAgentId && referralCommissionMinor >= priceMinor) throw new Error('commission must be below price');
   const entries: LedgerEntry[] = [
-    { account: 'payment_provider_clearing', amountMinor: priceMinor, currency: 'USD' },
-    { account: 'passport_revenue', amountMinor: -priceMinor, currency: 'USD' },
+    { account: 'payment_provider_clearing', scopeType: 'platform', scopeId: 'platform', amountMinor: priceMinor, currency: 'USD' },
+    { account: 'passport_revenue', scopeType: 'platform', scopeId: 'platform', amountMinor: -priceMinor, currency: 'USD' },
   ];
-  if (hasReferrer && referralCommissionMinor > 0n) {
+  if (referrerAgentId && referralCommissionMinor > 0n) {
     entries.push(
-      { account: 'passport_revenue', amountMinor: referralCommissionMinor, currency: 'USD' },
-      { account: 'agent_owner_pending_balance', amountMinor: -referralCommissionMinor, currency: 'USD' },
+      { account: 'passport_revenue', scopeType: 'platform', scopeId: 'platform', amountMinor: referralCommissionMinor, currency: 'USD' },
+      { account: 'agent_owner_pending_balance', scopeType: 'agent', scopeId: referrerAgentId, amountMinor: -referralCommissionMinor, currency: 'USD' },
     );
   }
-  return ledger.post({
-    idempotencyKey: `purchase:${purchaseId}`,
-    externalReference: purchaseId,
-    entries,
-  });
+  assertBalancedEntries(entries);
+  return entries;
 }
 
-function canonicalize(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((k) => `${JSON.stringify(k)}:${canonicalize(record[k])}`).join(',')}}`;
+export function passportRefundEntries(priceMinor: bigint, referralCommissionMinor: bigint, referrerAgentId?: string): LedgerEntry[] {
+  if (priceMinor <= 0n) throw new Error('price must be positive');
+  const entries: LedgerEntry[] = [
+    { account: 'refunds', scopeType: 'platform', scopeId: 'platform', amountMinor: priceMinor, currency: 'USD' },
+    { account: 'payment_provider_clearing', scopeType: 'platform', scopeId: 'platform', amountMinor: -priceMinor, currency: 'USD' },
+  ];
+  if (referrerAgentId && referralCommissionMinor > 0n) {
+    entries.push(
+      { account: 'agent_owner_pending_balance', scopeType: 'agent', scopeId: referrerAgentId, amountMinor: referralCommissionMinor, currency: 'USD' },
+      { account: 'refunds', scopeType: 'platform', scopeId: 'platform', amountMinor: -referralCommissionMinor, currency: 'USD' },
+    );
   }
-  return JSON.stringify(value);
+  assertBalancedEntries(entries);
+  return entries;
 }
