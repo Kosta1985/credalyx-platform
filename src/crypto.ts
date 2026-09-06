@@ -36,15 +36,22 @@ export function canonicalize(value: unknown): string {
 
 export function assertEd25519PublicKey(publicKeyPem: string): void {
   const key = createPublicKey(publicKeyPem);
-  if (key.asymmetricKeyType !== 'ed25519') throw new Error('agent public key must be Ed25519');
+  if (key.asymmetricKeyType !== 'ed25519') throw new Error('public key must be Ed25519');
+}
+
+function ed25519Fingerprint(publicKeyPem: string): string {
+  const key = createPublicKey(publicKeyPem);
+  if (key.asymmetricKeyType !== 'ed25519') throw new Error('public key must be Ed25519');
+  const der = key.export({ format: 'der', type: 'spki' });
+  return createHash('sha256').update(der).digest('base64url');
 }
 
 export function agentKeyId(publicKeyPem: string): string {
-  const key = createPublicKey(publicKeyPem);
-  if (key.asymmetricKeyType !== 'ed25519') throw new Error('agent public key must be Ed25519');
-  const der = key.export({ format: 'der', type: 'spki' });
-  const fingerprint = createHash('sha256').update(der).digest('base64url');
-  return `key_ed25519_${fingerprint}`;
+  return `key_ed25519_${ed25519Fingerprint(publicKeyPem)}`;
+}
+
+export function issuerKeyId(publicKeyPem: string): string {
+  return `issuer_ed25519_${ed25519Fingerprint(publicKeyPem)}`;
 }
 
 export function createChallenge(): string {

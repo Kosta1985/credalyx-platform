@@ -2,160 +2,130 @@
 
 ## Product boundary
 
-CREDALYX provides a private-sector trust credential for software agents. The credential communicates platform-observed verification state; it does not assert governmental identity, licensing, KYC or regulatory approval. The internal wallet is a double-entry accounting view, not a bank account or stored-value product.
+CREDALYX provides a private-sector trust credential for software agents. It does not assert governmental identity, licensing, KYC or regulatory approval. The internal wallet is an accounting view, not a bank account or stored-value product.
 
 ## Architecture style
 
-The MVP is a **modular monolith with explicit domain boundaries** and PostgreSQL transaction boundaries for critical financial and credential operations. Passport issuance, purchase finalization, referral commission creation and ledger posting are atomic. Refunds and chargebacks are separate compensating transactions rather than mutations of historical finance rows. Agent key rotation is also transactional: a new key is not activated until dual cryptographic proof succeeds and all passport/version updates can commit together.
+The MVP is a **modular monolith with explicit domain boundaries** and PostgreSQL transaction boundaries for financial and credential state. Critical modules are intentionally adapter-driven so payment, issuer custody and verification providers can change without rewriting domain rules.
 
 Logical modules:
 
 1. Identity / tenancy
 2. Agent registry
-3. Agent credential lifecycle and endpoint control verification
+3. Agent credential lifecycle
 4. Verification workflow
-5. Passport issuer / status registry
+5. Agent Passport issuer + issuer key registry
 6. Payment provider adapters
-7. Ledger
+7. Double-entry ledger
 8. Referrals / payouts
 9. Audit / risk / incidents
-10. Public API and A2A discovery
-
-A future monorepo split may separate deployables and SDKs without changing domain interfaces.
+10. Public verification and A2A discovery
 
 ## Trust boundaries
 
-- **Owner -> API:** signed JWT from trusted IdP; tenant data is selected from verified claims and server-side membership state.
-- **Agent -> API:** Ed25519 proof of possession; static API keys are not accepted as proof of agent identity.
-- **Payment provider -> API:** provider-specific signed webhook; sandbox uses timestamp + canonical-payload HMAC.
-- **API -> PostgreSQL:** financial and credential-state writes occur inside transactions; sealed ledger history is DB-protected.
-- **Passport issuer key:** production target is KMS/HSM. Repository contains no production issuer secret.
-- **Agent endpoint:** untrusted network destination. Endpoint probing must use SSRF-safe egress policy before it is introduced.
+- **Owner -> API:** verified JWT and server-side tenant authorization.
+- **Agent -> API:** Ed25519 proof of possession; static API keys are not proof of agent identity.
+- **Payment provider -> API:** provider-specific signed webhook; current sandbox uses timestamped HMAC.
+- **API -> PostgreSQL:** transactional financial/credential writes; sealed ledger history is DB-protected.
+- **API -> issuer signing backend:** key ID + payload in, signature out. Production target is non-exportable KMS/HSM custody.
+- **Public verifier -> issuer registry/JWKS:** public key/status only, with no access to signing custody.
+- **Agent endpoint:** untrusted network destination; active probing requires future SSRF-safe egress policy.
 
-## Agent key identity
+## Agent keys
 
-Every Ed25519 verification key has a deterministic external key ID:
+Agent Ed25519 keys use deterministic external IDs:
 
 `key_ed25519_<base64url(SHA-256(SPKI DER))>`
 
-The public fingerprint, rather than a mutable label such as `primary`, is the identity exposed in challenge responses and passport claims. Database rows retain internal UUIDs for referential integrity.
+Control challenges bind to the exact active key. Normal rotation requires signatures from both the old and proposed new private keys over one rotation-specific payload. PostgreSQL permits one active key and one pending rotation per agent.
 
-Historical key rows are never overwritten. Rotation marks the previous key revoked and appends the replacement key. A historical passport can therefore resolve the exact verification key it originally referenced.
+Historical keys are retained. Emergency current-key revocation suspends the agent and revokes active passports without silently trusting a replacement key.
 
-## Agent control protocol
+## Passport issuance
 
-1. Owner registers an Ed25519 public key and HTTPS A2A endpoint.
-2. API resolves the exact current key and returns a 256-bit random challenge plus canonical signing payload containing `agent_id`, `key_id` and challenge.
-3. Agent signs the payload with the private key matching that exact key ID.
-4. API verifies the signature against the bound public key.
-5. PostgreSQL atomically consumes the challenge only if the bound key is still the current active key and raises verification to Level 1.
-6. Replay, expired, stale-key or revoked-key challenges fail.
+Payment and agent-control preconditions are checked before issuance. A successful payment event must correlate to a persisted checkout by provider, purchase, agent, amount and currency. Purchase + passport + sealed sale ledger + pending referral commission commit atomically.
 
-## Agent key rotation
+Normal agent-key rotation reissues an active passport without a second commercial purchase. The new passport version preserves original expiry and purchase association and references the replacement agent key.
 
-Normal rotation is intentionally stronger than authenticated account access alone.
+## Issuer signing key architecture
 
-1. Authenticated owner submits a proposed new Ed25519 public key.
-2. Server validates the key, computes its deterministic fingerprint and creates one pending rotation with a random challenge and expiry.
-3. Rotation signing payload includes the agent ID, rotation ID, old key ID, new key ID and one-time challenge.
-4. Client produces **two signatures over the same payload**: one using the current private key and one using the proposed new private key.
-5. Both signatures are verified before the persistence transaction starts.
-6. PostgreSQL locks the rotation/current key, confirms it has not changed, revokes the old key and activates the new key atomically.
-7. A partial unique index allows only one active key per agent, and another allows only one pending rotation.
+### Key identity
 
-A proposed key is not inserted as active before completion. This prevents a half-created rotation from changing live trust state.
+Issuer Ed25519 keys use a separate deterministic namespace:
 
-## Emergency key revocation and recovery boundary
+`issuer_ed25519_<base64url(SHA-256(SPKI DER))>`
 
-Emergency revocation is allowed for an authenticated owner when a specific key is suspected compromised. If that key is currently active:
+New passports use schema 1.1 and sign `issuer_key_id` into the claims.
 
-- the key is marked revoked;
-- the agent status becomes `suspended`;
-- all active passports are revoked;
-- the agent remains publicly/readably addressable using historical metadata;
-- no replacement key is trusted automatically.
+### Custody adapter
 
-The lifecycle-aware PostgreSQL runtime store deliberately falls back to the latest historical key when no active key exists so audit/status/recovery routes can still resolve the suspended agent. Credential-issuing routes separately require an eligible non-suspended state and an active key.
+`IssuerSigningBackend` is asynchronous and exposes:
 
-Installing a replacement key after loss of the old private key is **not** normal rotation and remains a future high-assurance recovery workflow requiring step-up authentication and/or manual review.
+- current public key descriptor;
+- historical public descriptors;
+- `sign(keyId, payload)`;
+- lifecycle close hook.
 
-## Passport
+There is deliberately no private-key export method. `LocalEd25519IssuerBackend` is development/test only. A production provider can map the same interface to AWS KMS, Google Cloud KMS, Azure Key Vault, an HSM or another non-exportable signing service.
 
-The passport uses Ed25519 over deterministic canonical JSON claims. Claims contain no owner email/name. Public status is resolved separately, so revocation takes effect without modifying the signed historical credential.
+### Public registry
 
-Each passport includes:
+`issuer_signing_keys` stores only public metadata and opaque provider references:
 
-- immutable `passport_id`;
-- monotonically increasing `passport_version` for non-commercial credential reissue;
-- exact agent key reference containing the deterministic key ID;
-- issuer, verification level, capabilities, issue/expiry timestamps and status reference.
+- deterministic key ID;
+- public PEM/JWK;
+- algorithm;
+- provider + provider key reference;
+- `active | retired | revoked` status and timestamps.
 
-### Passport reissue after agent key rotation
+`issuer_key_status_history` records transitions. A partial unique index guarantees one active issuer key.
 
-Normal agent key rotation must not silently leave an active passport pointing at a revoked key. If an active passport exists, the same database transaction:
+At startup the issuer service synchronizes backend public metadata to the registry and verifies that backend/registry agree on the active key before issuing.
 
-1. locks the active passport;
-2. verifies the proposed replacement is the next passport version;
-3. verifies the replacement preserves the original expiry;
-4. revokes the old passport version and appends status history;
-5. inserts the replacement passport referencing the new key;
-6. preserves the original purchase association;
-7. does **not** create a second payment, purchase or referral commission.
+### Verification continuity
 
-Production issuer-key requirements remain separate:
+For schema 1.1, verification resolves the signed exact issuer key ID. `active` and `retired` keys can verify historical credentials; `revoked` keys cannot.
 
-- stable issuer key ID/version;
-- managed private-key custody;
-- rotation overlap;
-- public verification-key endpoint/JWKS or equivalent;
-- emergency issuer compromise/revocation procedure.
+For legacy schema 1.0, which lacked signed issuer key attribution, the verifier tests the signature against retained non-revoked historical issuer keys.
 
-## Checkout and payment correlation
+Public discovery:
 
-A valid provider signature is necessary but not sufficient to issue a passport.
+```text
+/.well-known/agent-passport-issuer.json
+/.well-known/jwks.json
+/v1/issuer/keys/{issuer_key_id}
+```
 
-1. Authenticated owner requests `passport-checkout` for a Level 1-controlled, non-suspended agent.
-2. Server chooses price/currency and creates a purchase reference.
-3. Provider adapter creates hosted checkout; CREDALYX persists the provider session, purchase reference and idempotency key.
-4. `payment.succeeded` must match the persisted provider, purchase, agent, amount and currency.
-5. PostgreSQL re-checks that the agent does not already have an active unexpired passport.
-6. Purchase + passport + sale ledger + pending referral commission are committed atomically.
+JWKS includes active and retired non-revoked keys only.
 
-The current adapter is no-money sandbox only. Production startup fails closed until a licensed-provider adapter is configured with provider-native signature verification.
+## Ledger/referrals
 
-## Ledger and referral lifecycle
-
-Ledger convention: positive amounts are debits, negative amounts are credits. Every transaction sums to zero per currency.
-
-Accounts are scoped:
-
-- platform accounts use `(platform, platform)`;
-- referral balances use `(agent, <referrer internal id>)`.
-
-PostgreSQL seals a transaction only after checking it contains at least two entries and balances. After sealing, entries cannot be added, updated or deleted.
+Ledger convention: positive amounts are debits, negative amounts are credits. Every transaction must sum to zero per currency. Sealed transactions/entries cannot be edited or deleted.
 
 Referral lifecycle:
 
-1. Successful referred sale credits `agent_owner_pending_balance`.
-2. Reward remains pending until `hold_until`.
-3. Release worker selects eligible rows using `FOR UPDATE SKIP LOCKED` and posts a new balanced `commission_release` transaction moving pending -> available.
-4. Refund or chargeback posts a new balanced reversal transaction, revokes the linked passport and marks the commission reversed.
-5. If a reward was already released, reversal debits available balance. Future payout logic must block withdrawal while ledger-derived debt is positive.
+1. referred sale -> pending agent-scoped balance;
+2. hold window;
+3. concurrency-safe release (`FOR UPDATE SKIP LOCKED`) -> available;
+4. refund/chargeback -> compensating transaction and commission reversal;
+5. debt blocks future payout eligibility.
 
-Wallet APIs derive balances from sealed ledger entries. Commission rows provide lifecycle metadata but are not the authoritative mutable balance.
+Wallet values are derived from sealed ledger entries.
 
-## Payout policy boundary
+## Production fail-closed behavior
 
-`MIN_PAYOUT_MINOR` is configurable and defaults to USD 25.00 for batching. It is an operational default, not a legal conclusion. Real payout onboarding, sanctions/eligibility checks, payout initiation and reconciliation are not enabled until a provider-managed payout adapter exists.
+Production requires PostgreSQL, trusted JWT verification, a licensed payment provider adapter and managed issuer custody. The current build intentionally rejects production use because the real payment adapter and concrete managed issuer backend are not yet installed.
+
+Selecting `PASSPORT_ISSUER_BACKEND=managed` requires an opaque provider key reference and currently fails explicitly rather than silently falling back to local/ephemeral PEM signing.
 
 ## A2A interoperability
 
-A2A v1.0 discovery is exposed with `supportedInterfaces[]`. The current Agent Card advertises only the passport-verification skill. Full task/message handling and TCK conformance are intentionally not claimed yet.
+A2A Protocol 1.0 discovery is exposed at `/.well-known/agent-card.json`. The current Agent Card advertises passport verification; full task/message TCK conformance remains later work.
 
 ## Data minimization
 
-Public agent and passport responses contain technical agent metadata only. Owner identity is not embedded into passports. Verification evidence is referenced rather than copied into public objects. Payment card data and agent private keys are never accepted by CREDALYX endpoints.
+Passports contain technical agent metadata, not owner email/name. Payment card data, private agent keys and production issuer private keys are never accepted into the public registry/API. Production issuer signing should occur inside managed custody.
 
 ## Evolution
 
-Persistence, credential lifecycle, payment and issuer layers are interfaces/adapters. Provider, price, commission, hold window, payout threshold and issuer implementation are configuration/injected dependencies rather than hard-coded business assumptions. Cursor pagination, payout orchestration, Level 2/3 verification, issuer KMS/HSM key versioning, account recovery and UI/SDKs are subsequent milestones.
+Next infrastructure milestones are real payment/payout provider adapters, managed issuer backend implementation/runbook, Level 2/3 verification, SSRF-safe endpoint verification, fraud/risk controls, operational telemetry/recovery, and SDK/web applications.

@@ -1,6 +1,7 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import * as schema from './schema.js';
+import * as issuerSchema from './issuer-schema.js';
+import * as foundationSchema from './schema.js';
 
 const connectionOptions = {
   max: 10,
@@ -8,6 +9,8 @@ const connectionOptions = {
   connect_timeout: 10,
   prepare: false,
 } as const;
+
+const schema = { ...foundationSchema, ...issuerSchema };
 
 export function createDatabase(databaseUrl: string) {
   // Drizzle mutates postgres.js date serializers/parsers on the client it receives.
