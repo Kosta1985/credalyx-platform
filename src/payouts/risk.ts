@@ -25,14 +25,14 @@ export interface PayoutRiskAssessment {
 }
 
 /**
- * Deterministic first-line payout policy. It intentionally errs toward review
- * rather than automatic release when velocity/reversal signals are elevated.
- * A production risk service can replace or enrich this policy without changing
- * the reservation/ledger transaction model.
+ * Deterministic first-line payout policy. Hard financial/eligibility failures
+ * deny, elevated fraud/velocity signals require review, and low-grade signals
+ * can increase the score without blocking a legitimate small payout.
  */
 export function assessPayoutRisk(input: PayoutRiskContext): PayoutRiskAssessment {
   const deny: string[] = [];
   const review: string[] = [];
+  const observations: string[] = [];
   let score = 0;
 
   if (input.agentStatus !== 'active') deny.push('agent_not_active');
@@ -57,14 +57,12 @@ export function assessPayoutRisk(input: PayoutRiskContext): PayoutRiskAssessment
     score += 40;
   }
   if (input.availableMinor > 0n && input.amountMinor * 100n >= input.availableMinor * 90n) {
-    review.push('withdraws_nearly_all_available_balance');
+    observations.push('withdraws_nearly_all_available_balance');
     score += 10;
   }
 
-  if (deny.length > 0) {
-    return { decision: 'deny', score: 100, reasons: [...deny, ...review] };
-  }
+  if (deny.length > 0) return { decision: 'deny', score: 100, reasons: [...deny, ...review, ...observations] };
   score = Math.min(100, score);
-  if (review.length > 0) return { decision: 'review', score, reasons: review };
-  return { decision: 'approve', score, reasons: [] };
+  if (review.length > 0) return { decision: 'review', score, reasons: [...review, ...observations] };
+  return { decision: 'approve', score, reasons: observations };
 }
