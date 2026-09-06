@@ -146,7 +146,7 @@ export class PostgresCredentialLifecycleStore implements CredentialLifecycleStor
         where agent_id = ${agent.id} and disabled_at is null
       `;
       await tx`
-        insert into audit_events (id, actor_type, actor_subject, action, target_type, target_id, created_at)
+        insert into audit_events (id, actor_type, actor_subject, action, target_type, target_id, occurred_at)
         values (${uuidv7()}, 'agent', ${agent.publicId}, 'agent.control_verified', 'agent', ${agent.publicId}, ${verifiedAt})
       `;
       return true;
@@ -335,7 +335,7 @@ export class PostgresCredentialLifecycleStore implements CredentialLifecycleStor
         where id = ${input.rotationId}
       `;
       await tx`
-        insert into audit_events (id, actor_type, actor_subject, action, target_type, target_id, metadata, created_at)
+        insert into audit_events (id, actor_type, actor_subject, action, target_type, target_id, metadata, occurred_at)
         values (
           ${uuidv7()}, 'owner', ${input.actorSubject}, 'agent.key_rotated', 'agent', ${input.agent.publicId},
           ${JSON.stringify({
@@ -400,7 +400,7 @@ export class PostgresCredentialLifecycleStore implements CredentialLifecycleStor
         passportRevoked = passports.length > 0;
       }
       await tx`
-        insert into audit_events (id, actor_type, actor_subject, action, target_type, target_id, metadata, created_at)
+        insert into audit_events (id, actor_type, actor_subject, action, target_type, target_id, metadata, occurred_at)
         values (
           ${uuidv7()}, 'owner', ${actorSubject}, 'agent.key_emergency_revoked', 'agent_key', ${keyId},
           ${JSON.stringify({ agent_id: agent.publicId, reason_code: reasonCode, suspended_agent: wasCurrent })}::jsonb,
