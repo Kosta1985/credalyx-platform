@@ -1,6 +1,6 @@
 ---
 name: Security hardening
-aabout: Track a security, fraud, privacy or financial-control improvement
+about: Track a security, fraud, privacy or financial-control improvement
 title: '[hardening] '
 labels: ''
 assignees: ''
