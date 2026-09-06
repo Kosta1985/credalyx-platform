@@ -8,6 +8,7 @@ const envSchema = z.object({
   PASSPORT_PRICE_MINOR: z.coerce.number().int().positive().default(200),
   REFERRAL_COMMISSION_MINOR: z.coerce.number().int().nonnegative().default(100),
   REFERRAL_HOLD_DAYS: z.coerce.number().int().min(0).max(180).default(30),
+  MIN_PAYOUT_MINOR: z.coerce.number().int().positive().default(2500),
   PASSPORT_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   SANDBOX_WEBHOOK_SECRET: z.string().min(32),
   PASSPORT_ISSUER_PRIVATE_KEY_PEM: z.string().min(40).optional(),
@@ -24,6 +25,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const parsed = envSchema.parse(env);
   if (parsed.REFERRAL_COMMISSION_MINOR >= parsed.PASSPORT_PRICE_MINOR) {
     throw new Error('REFERRAL_COMMISSION_MINOR must be lower than PASSPORT_PRICE_MINOR');
+  }
+  if (parsed.MIN_PAYOUT_MINOR < parsed.REFERRAL_COMMISSION_MINOR) {
+    throw new Error('MIN_PAYOUT_MINOR must be at least one referral commission');
   }
   if (parsed.NODE_ENV === 'production') {
     if (!parsed.DATABASE_URL) throw new Error('DATABASE_URL is required in production');

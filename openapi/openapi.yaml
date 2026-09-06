@@ -1,11 +1,12 @@
 openapi: 3.1.0
 info:
   title: CREDALYX Agent Passport API
-  version: 0.2.0
+  version: 0.3.0
   description: |
-    API for registering AI agents, proving control of an Ed25519 key, issuing and verifying
-    internal CREDALYX Agent Passports, and processing provider-signed payment events.
-    Agent Passports are not government identity documents, licences or regulatory approvals.
+    API for registering AI agents, proving control of an Ed25519 key, creating provider checkout
+    sessions, issuing and verifying internal CREDALYX Agent Passports, and exposing referral-ledger
+    wallet views. Agent Passports are not government identity documents, licences, KYC results,
+    regulatory approvals, or stored-value bank accounts.
 servers:
   - url: https://api.example.invalid
 security:
@@ -23,8 +24,7 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              $ref: '#/components/schemas/CreateAgentRequest'
+            schema: { $ref: '#/components/schemas/CreateAgentRequest' }
       responses:
         '201':
           description: Agent registered
@@ -39,6 +39,7 @@ paths:
                   referral_code: { type: string }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: Registration or referral conflict }
   /v1/agents/{agent_id}:
     parameters:
       - $ref: '#/components/parameters/AgentId'
@@ -50,8 +51,7 @@ paths:
           description: Public agent record
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/PublicAgent'
+              schema: { $ref: '#/components/schemas/PublicAgent' }
         '404': { $ref: '#/components/responses/NotFound' }
   /v1/agents/{agent_id}/keys/current:
     parameters:
@@ -60,7 +60,7 @@ paths:
       security: []
       summary: Resolve current agent verification key
       responses:
-        '200': { description: Current key }
+        '200': { description: Current Ed25519 key }
         '404': { $ref: '#/components/responses/NotFound' }
   /v1/agents/{agent_id}/challenge:
     parameters:
@@ -81,6 +81,7 @@ paths:
                   algorithm: { const: Ed25519 }
                   expires_at: { type: string, format: date-time }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /v1/agents/{agent_id}/verify-control:
     parameters:
       - $ref: '#/components/parameters/AgentId'
@@ -92,6 +93,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [challenge, signature]
               properties:
                 challenge: { type: string }
@@ -102,12 +104,33 @@ paths:
         '200': { description: Control verified }
         '401': { description: Invalid signature, expired challenge, or replay }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/agents/{agent_id}/passport-checkout:
+    parameters:
+      - $ref: '#/components/parameters/AgentId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+    post:
+      summary: Create a hosted checkout session for an Agent Passport
+      description: |
+        The server selects the configured price and currency. Frontend-provided prices are not accepted.
+        A successful payment webhook must correlate back to this persisted checkout before a passport can issue.
+      responses:
+        '201':
+          description: Checkout created or idempotently returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckoutSession' }
+        '400': { description: Missing/invalid idempotency key }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Agent not verified, active passport exists, or idempotency conflict }
   /v1/webhooks/payment-provider:
     post:
       security: []
       summary: Sandbox payment-provider webhook
       description: |
-        Sandbox adapter. Production adapters must implement the selected provider's raw-body signature verification.
+        Sandbox-only adapter. Production startup rejects this adapter. A production provider integration must
+        verify the provider's native signature over the required raw request representation before processing.
       parameters:
         - in: header
           name: x-sandbox-timestamp
@@ -122,12 +145,61 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PaymentSucceededEvent'
+              oneOf:
+                - $ref: '#/components/schemas/PaymentSucceededEvent'
+                - $ref: '#/components/schemas/PaymentReversalEvent'
+              discriminator:
+                propertyName: type
       responses:
-        '201': { description: Passport issued atomically with ledger posting }
-        '200': { description: Duplicate event already handled }
+        '201': { description: Payment accepted and passport issued atomically with ledger posting }
+        '200': { description: Reversal processed or provider retry already handled }
+        '400': { description: Invalid event shape }
         '401': { description: Invalid webhook signature }
-        '409': { description: Payment amount mismatch or agent not verified }
+        '404': { description: Checkout session or purchase not found }
+        '409': { description: Payment/session mismatch or finalization precondition failed }
+  /v1/wallet:
+    get:
+      summary: Read the authenticated owner's referral wallet for one agent
+      parameters:
+        - in: query
+          name: agent_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Ledger-derived wallet snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WalletSnapshot' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/wallet/transactions:
+    get:
+      summary: Read recent agent-scoped referral ledger entries
+      parameters:
+        - in: query
+          name: agent_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        '200':
+          description: Recent sealed ledger entries. Cursor pagination is scheduled before production launch.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WalletTransaction' }
+                  has_more: { type: boolean }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /v1/passports/{passport_id}:
     parameters:
       - $ref: '#/components/parameters/PassportId'
@@ -176,6 +248,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [reason_code]
               properties:
                 reason_code: { type: string, minLength: 3, maxLength: 128 }
@@ -206,7 +279,17 @@ components:
       name: passport_id
       required: true
       schema: { type: string }
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      description: Client-generated key scoped to the authenticated owner and agent checkout intent.
+      schema: { type: string, minLength: 16, maxLength: 128 }
   schemas:
+    MoneyMinorString:
+      type: string
+      pattern: '^-?[0-9]+$'
+      description: Integer monetary amount in the currency's minor unit, serialized as a decimal string.
     CreateAgentRequest:
       type: object
       additionalProperties: false
@@ -231,6 +314,16 @@ components:
         capabilities: { type: array, items: { type: string } }
         verification_level: { type: integer, minimum: 0, maximum: 3 }
         status: { enum: [pending, active, suspended, revoked] }
+    CheckoutSession:
+      type: object
+      required: [purchase_id, provider, checkout_url, amount_minor, currency, expires_at]
+      properties:
+        purchase_id: { type: string }
+        provider: { type: string }
+        checkout_url: { type: string, format: uri }
+        amount_minor: { $ref: '#/components/schemas/MoneyMinorString' }
+        currency: { const: USD }
+        expires_at: { type: string, format: date-time }
     PaymentSucceededEvent:
       type: object
       additionalProperties: false
@@ -241,6 +334,48 @@ components:
         purchase_id: { type: string }
         agent_id: { type: string }
         amount_minor: { type: integer, minimum: 1 }
+        currency: { const: USD }
+    PaymentReversalEvent:
+      type: object
+      additionalProperties: false
+      required: [event_id, type, purchase_id, amount_minor, currency, reason_code]
+      properties:
+        event_id: { type: string }
+        type: { enum: [payment.refunded, payment.chargeback] }
+        purchase_id: { type: string }
+        amount_minor: { type: integer, minimum: 1 }
+        currency: { const: USD }
+        reason_code: { type: string, minLength: 3, maxLength: 128 }
+    WalletSnapshot:
+      type: object
+      required:
+        - currency
+        - pending_minor
+        - available_minor
+        - debt_minor
+        - paid_minor
+        - reversed_minor
+        - min_payout_minor
+        - payout_eligible
+      properties:
+        currency: { const: USD }
+        pending_minor: { $ref: '#/components/schemas/MoneyMinorString' }
+        available_minor: { $ref: '#/components/schemas/MoneyMinorString' }
+        debt_minor: { $ref: '#/components/schemas/MoneyMinorString' }
+        paid_minor: { $ref: '#/components/schemas/MoneyMinorString' }
+        reversed_minor: { $ref: '#/components/schemas/MoneyMinorString' }
+        min_payout_minor: { $ref: '#/components/schemas/MoneyMinorString' }
+        payout_eligible: { type: boolean }
+    WalletTransaction:
+      type: object
+      required: [transaction_id, transaction_type, external_reference, created_at, account, amount_minor, currency]
+      properties:
+        transaction_id: { type: string, format: uuid }
+        transaction_type: { type: string }
+        external_reference: { type: string }
+        created_at: { type: string, format: date-time }
+        account: { type: string }
+        amount_minor: { $ref: '#/components/schemas/MoneyMinorString' }
         currency: { const: USD }
   responses:
     BadRequest:
