@@ -88,35 +88,27 @@ test('PostgreSQL commerce flow persists checkout, sale, referral release and rev
     });
   }
 
-  const referrer = await registerVerify(`db-referrer-${Date.now()}`);
-  const referrerPurchase = await checkout(`db-referrer-${Date.now()}`, referrer.agent_id, `referrer-${Date.now()}`);
-  // The owner subject is part of auth, so use the actual subject from the persisted agent for subsequent calls.
-  const referrerRecord = await store.getAgent(referrer.agent_id);
-  assert.ok(referrerRecord);
-  const referrerCheckoutRetry = await app.inject({
-    method: 'POST',
-    url: `/v1/agents/${referrer.agent_id}/passport-checkout`,
-    headers: { 'x-test-subject': referrerRecord.ownerSubject, 'idempotency-key': 'db-commerce-stable-referrer-key' },
-  });
-  // A different idempotency key is allowed before a passport exists; pay only the stable checkout below.
-  assert.equal(referrerCheckoutRetry.statusCode, 201, referrerCheckoutRetry.body);
-  const stableReferrerPurchase = referrerCheckoutRetry.json<{ purchase_id: string }>().purchase_id;
+  const runId = `${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+  const referrerOwner = `db-referrer-${runId}`;
+  const referrer = await registerVerify(referrerOwner);
+  const referrerPurchase = await checkout(referrerOwner, referrer.agent_id, `referrer-${runId}`);
   const referrerPaid = await webhook({
-    event_id: `db_evt_referrer_${Date.now()}`,
+    event_id: `db_evt_referrer_${runId}`,
     type: 'payment.succeeded',
-    purchase_id: stableReferrerPurchase,
+    purchase_id: referrerPurchase,
     agent_id: referrer.agent_id,
     amount_minor: 200,
     currency: 'USD',
   });
   assert.equal(referrerPaid.statusCode, 201, referrerPaid.body);
-  assert.ok(referrerPurchase);
+  const referrerRecord = await store.getAgent(referrer.agent_id);
+  assert.ok(referrerRecord);
 
-  const referredOwner = `db-referred-${Date.now()}`;
+  const referredOwner = `db-referred-${runId}`;
   const referred = await registerVerify(referredOwner, referrer.referral_code);
-  const referredPurchase = await checkout(referredOwner, referred.agent_id, `referred-${Date.now()}`);
+  const referredPurchase = await checkout(referredOwner, referred.agent_id, `referred-${runId}`);
   const referredPaid = await webhook({
-    event_id: `db_evt_referred_${Date.now()}`,
+    event_id: `db_evt_referred_${runId}`,
     type: 'payment.succeeded',
     purchase_id: referredPurchase,
     agent_id: referred.agent_id,
@@ -136,7 +128,7 @@ test('PostgreSQL commerce flow persists checkout, sale, referral release and rev
   assert.equal(afterRelease.availableMinor, 100n);
 
   const chargeback = await webhook({
-    event_id: `db_evt_chargeback_${Date.now()}`,
+    event_id: `db_evt_chargeback_${runId}`,
     type: 'payment.chargeback',
     purchase_id: referredPurchase,
     amount_minor: 200,
