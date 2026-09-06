@@ -19,8 +19,12 @@ import {
 import { registerCredentialRoutes } from './credentials/routes.js';
 import { PostgresCredentialLifecycleStore } from './credentials/store-postgres.js';
 import type { CredentialLifecycleStore } from './credentials/store.js';
-import { assertReferralAllowed, passportSaleEntries, PassportSigner, type AgentRecord } from './domain.js';
+import { assertReferralAllowed, passportSaleEntries, PassportSigner, type AgentRecord, type SignedPassport } from './domain.js';
 import { PostgresLifecyclePlatformStore } from './db/store-postgres-lifecycle.js';
+import { LocalEd25519IssuerBackend } from './issuer/backend.js';
+import { registerIssuerRoutes } from './issuer/routes.js';
+import { PassportIssuerService } from './issuer/service.js';
+import { PostgresIssuerKeyRegistryStore } from './issuer/store-postgres.js';
 import type { PaymentProvider } from './payments/provider.js';
 import { SandboxPaymentProvider } from './payments/sandbox.js';
 import type { PlatformStore } from './store.js';
@@ -38,7 +42,8 @@ export interface RuntimeConfig {
 
 export interface AppDependencies {
   store: PlatformStore;
-  signer: PassportSigner;
+  signer?: PassportSigner;
+  issuer?: PassportIssuerService;
   authenticate: Authenticator;
   paymentProvider: PaymentProvider;
   config: RuntimeConfig;
@@ -79,6 +84,8 @@ const paymentReversalSchema = z.object({
 const paymentEventSchema = z.discriminatedUnion('type', [paymentSucceededSchema, paymentReversalSchema]);
 
 export async function buildApp(deps: AppDependencies) {
+  if (!deps.issuer && !deps.signer) throw new Error('passport issuer dependency is required');
+
   const app = Fastify({
     logger: {
       redact: [
@@ -123,7 +130,25 @@ export async function buildApp(deps: AppDependencies) {
     return principal.subject === agent.ownerSubject;
   }
 
+  async function issuePassport(
+    agent: AgentRecord,
+    ttlDays: number,
+    passportVersion = 1,
+    preserveExpiresAt?: Date,
+  ): Promise<SignedPassport> {
+    if (deps.issuer) return deps.issuer.issue(agent, ttlDays, passportVersion, preserveExpiresAt);
+    if (!deps.signer) throw new Error('passport issuer is unavailable');
+    return deps.signer.issue(agent, ttlDays, passportVersion, preserveExpiresAt);
+  }
+
+  async function verifyPassport(passport: SignedPassport): Promise<boolean> {
+    if (deps.issuer) return deps.issuer.verify(passport);
+    if (!deps.signer) return false;
+    return deps.signer.verify(passport);
+  }
+
   app.get('/healthz', async () => ({ status: 'ok' }));
+  if (deps.issuer) registerIssuerRoutes(app, deps.issuer);
 
   app.post('/v1/agents', async (request, reply) => {
     const principal = await principalOrReply(request, reply);
@@ -290,7 +315,7 @@ export async function buildApp(deps: AppDependencies) {
       app,
       store: deps.store,
       credentials: deps.credentials,
-      signer: deps.signer,
+      issuePassport,
       authenticate: deps.authenticate,
       passportTtlDays: deps.config.passportTtlDays,
     });
@@ -378,7 +403,7 @@ export async function buildApp(deps: AppDependencies) {
         return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_PASSPORT', status: agent.status });
       }
       if (agent.verificationLevel < 1 || !agent.controlVerifiedAt) return reply.code(409).send({ code: 'AGENT_CONTROL_NOT_VERIFIED' });
-      const passport = deps.signer.issue(agent, deps.config.passportTtlDays);
+      const passport = await issuePassport(agent, deps.config.passportTtlDays);
       const ledgerEntries = passportSaleEntries(deps.config.passportPriceMinor, deps.config.referralCommissionMinor, agent.referrerAgentId);
       try {
         const result = await deps.store.finalizePassportPurchase({
@@ -477,7 +502,12 @@ export async function buildApp(deps: AppDependencies) {
     const { passportId } = request.params as { passportId: string };
     const passport = await deps.store.getPassport(passportId);
     if (!passport) return reply.code(404).send({ code: 'PASSPORT_NOT_FOUND' });
-    return { valid: deps.signer.verify(passport), status: passport.status, agent_id: passport.claims.agent_id };
+    return {
+      valid: await verifyPassport(passport),
+      status: passport.status,
+      agent_id: passport.claims.agent_id,
+      issuer_key_id: passport.claims.issuer_key_id ?? null,
+    };
   });
 
   app.post('/v1/passports/:passportId/revoke', async (request, reply) => {
@@ -498,7 +528,7 @@ export async function buildApp(deps: AppDependencies) {
   app.get('/.well-known/agent-card.json', async () => ({
     name: 'CREDALYX Agent Passport Network',
     description: 'Cryptographic agent identity, passport status and trust verification service.',
-    version: '0.4.0',
+    version: '0.5.0',
     supportedInterfaces: [{
       url: `${deps.config.publicBaseUrl.replace(/\/$/, '')}/a2a`,
       protocolBinding: 'HTTP+JSON',
@@ -521,6 +551,7 @@ export async function buildApp(deps: AppDependencies) {
     await Promise.all([
       deps.store.close(),
       deps.credentials?.close() ?? Promise.resolve(),
+      deps.issuer?.close() ?? Promise.resolve(),
     ]);
   });
   return app;
@@ -576,13 +607,21 @@ async function startServer(): Promise<void> {
   if (config.NODE_ENV === 'production') {
     throw new Error('production payment provider adapter is not configured; sandbox payments are forbidden in production');
   }
-  const signer = config.PASSPORT_ISSUER_PRIVATE_KEY_PEM && config.PASSPORT_ISSUER_PUBLIC_KEY_PEM
-    ? new PassportSigner({
+
+  const backend = config.PASSPORT_ISSUER_PRIVATE_KEY_PEM && config.PASSPORT_ISSUER_PUBLIC_KEY_PEM
+    ? LocalEd25519IssuerBackend.fromPem({
         privateKeyPem: config.PASSPORT_ISSUER_PRIVATE_KEY_PEM,
         publicKeyPem: config.PASSPORT_ISSUER_PUBLIC_KEY_PEM,
-        issuer: config.PUBLIC_BASE_URL,
+        providerKeyReference: 'env:PASSPORT_ISSUER_PRIVATE_KEY_PEM',
       })
-    : PassportSigner.ephemeral(config.PUBLIC_BASE_URL);
+    : LocalEd25519IssuerBackend.ephemeral();
+  const issuer = new PassportIssuerService(
+    config.PUBLIC_BASE_URL,
+    backend,
+    new PostgresIssuerKeyRegistryStore(config.DATABASE_URL),
+  );
+  await issuer.initialize();
+
   const authenticate = await createJwtAuthenticator({
     publicKeyPem: config.AUTH_JWT_PUBLIC_KEY_PEM,
     algorithm: config.AUTH_JWT_ALG,
@@ -592,7 +631,7 @@ async function startServer(): Promise<void> {
   const app = await buildApp({
     store: new PostgresLifecyclePlatformStore(config.DATABASE_URL),
     credentials: new PostgresCredentialLifecycleStore(config.DATABASE_URL),
-    signer,
+    issuer,
     authenticate,
     paymentProvider: new SandboxPaymentProvider(),
     config: runtimeConfig(config),
