@@ -1,0 +1,292 @@
+openapi: 3.1.0
+info:
+  title: CREDALYX Payout Lifecycle API
+  version: 0.6.0
+  description: |
+    Phase 5 payout API. This contract covers provider-managed beneficiary onboarding,
+    risk-gated payout reservation, payout status/read models and provider reconciliation.
+    The current sandbox provider moves no real money and is development/test only.
+servers:
+  - url: https://api.example.invalid
+security:
+  - bearerAuth: []
+paths:
+  /v1/payouts/onboarding:
+    post:
+      summary: Create or refresh provider-managed payout beneficiary onboarding
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [agent_id]
+              properties:
+                agent_id: { type: string }
+      responses:
+        '201':
+          description: Onboarding session/account state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutAccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Agent not eligible for payouts }
+
+  /v1/payouts/account:
+    get:
+      summary: Read payout beneficiary onboarding state
+      parameters:
+        - $ref: '#/components/parameters/AgentIdQuery'
+      responses:
+        '200':
+          description: Payout account state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutAccount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/payouts:
+    post:
+      summary: Risk-assess, reserve and submit a payout
+      description: |
+        A new request is risk-assessed, then funds are atomically moved from available to
+        reserved before the provider is called. Idempotent retries resolve the original
+        payout before a new risk decision is performed.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [agent_id, amount_minor]
+              properties:
+                agent_id: { type: string }
+                amount_minor:
+                  type: string
+                  pattern: '^[1-9][0-9]{0,17}$'
+                  description: Integer USD minor units as a decimal string.
+      responses:
+        '201':
+          description: Newly reserved/submitted payout
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutEnvelope' }
+        '200':
+          description: Idempotent existing payout
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Onboarding required, denied/review risk decision, open payout, balance/debt or idempotency conflict.
+        '502':
+          description: Provider submission failed; reservation was released with a compensating ledger transaction.
+    get:
+      summary: List payouts for one managed agent
+      parameters:
+        - $ref: '#/components/parameters/AgentIdQuery'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        '200':
+          description: Payout history
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Payout' }
+                  has_more: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/payouts/summary:
+    get:
+      summary: Read payout reserved/paid summary for an agent
+      parameters:
+        - $ref: '#/components/parameters/AgentIdQuery'
+      responses:
+        '200':
+          description: Payout accounting read model
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [currency, reserved_minor, paid_minor, open_payout_count]
+                properties:
+                  currency: { const: USD }
+                  reserved_minor: { type: string, pattern: '^[0-9]+$' }
+                  paid_minor: { type: string, pattern: '^[0-9]+$' }
+                  open_payout_count: { type: integer, minimum: 0 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/payouts/{payout_id}:
+    parameters:
+      - in: path
+        name: payout_id
+        required: true
+        schema: { type: string, pattern: '^pay_[a-f0-9]{40}$' }
+      - $ref: '#/components/parameters/AgentIdQuery'
+    get:
+      summary: Read one payout
+      responses:
+        '200':
+          description: Payout
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/webhooks/payout-provider:
+    post:
+      security: []
+      summary: Sandbox payout reconciliation webhook
+      description: |
+        Development/test HMAC endpoint. Production must use provider-native raw-body
+        signature verification. Events are deduplicated by provider/event ID and must
+        match stored payout reference, provider payout ID, amount and currency.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/PayoutPaidEvent'
+                - $ref: '#/components/schemas/PayoutFailedEvent'
+              discriminator:
+                propertyName: type
+      responses:
+        '200':
+          description: Reconciled or duplicate event
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [duplicate]
+                properties:
+                  duplicate: { type: boolean }
+                  status: { enum: [pending, processing, paid, failed, cancelled] }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { description: Invalid webhook signature }
+        '404': { description: Payout not found }
+        '409': { description: Provider event correlation mismatch }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      schema: { type: string, minLength: 16, maxLength: 128 }
+    AgentIdQuery:
+      in: query
+      name: agent_id
+      required: true
+      schema: { type: string }
+  schemas:
+    PayoutAccount:
+      type: object
+      required: [provider, onboarding_status, onboarding_url, expires_at]
+      properties:
+        provider: { type: string }
+        onboarding_status: { enum: [pending, complete, restricted] }
+        onboarding_url:
+          oneOf: [{ type: string, format: uri }, { type: 'null' }]
+        expires_at:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+    RiskDecision:
+      type: object
+      required: [decision, score, reasons]
+      properties:
+        decision: { enum: [approve, review, deny] }
+        score: { type: integer, minimum: 0, maximum: 100 }
+        reasons: { type: array, items: { type: string } }
+    Payout:
+      type: object
+      required:
+        - payout_id
+        - provider
+        - provider_payout_id
+        - amount_minor
+        - currency
+        - status
+        - risk_decision
+        - risk_score
+        - reserved_at
+        - submitted_at
+        - processed_at
+        - failure_reason
+      properties:
+        payout_id: { type: string }
+        provider: { type: string }
+        provider_payout_id:
+          oneOf: [{ type: string }, { type: 'null' }]
+        amount_minor: { type: string, pattern: '^[0-9]+$' }
+        currency: { const: USD }
+        status: { enum: [pending, processing, paid, failed, cancelled] }
+        risk_decision: { enum: [approve, review, deny] }
+        risk_score: { type: integer, minimum: 0, maximum: 100 }
+        reserved_at: { type: string, format: date-time }
+        submitted_at:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        processed_at:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        failure_reason:
+          oneOf: [{ type: string }, { type: 'null' }]
+    PayoutEnvelope:
+      type: object
+      required: [payout]
+      properties:
+        payout: { $ref: '#/components/schemas/Payout' }
+    PayoutPaidEvent:
+      type: object
+      additionalProperties: false
+      required: [event_id, type, payout_id, provider_payout_id, amount_minor, currency]
+      properties:
+        event_id: { type: string }
+        type: { const: payout.paid }
+        payout_id: { type: string }
+        provider_payout_id: { type: string }
+        amount_minor: { type: string, pattern: '^[1-9][0-9]{0,17}$' }
+        currency: { const: USD }
+    PayoutFailedEvent:
+      allOf:
+        - $ref: '#/components/schemas/PayoutPaidEvent'
+        - type: object
+          required: [reason_code]
+          properties:
+            type: { const: payout.failed }
+            reason_code: { type: string, minLength: 3, maxLength: 128 }
+  responses:
+    BadRequest: { description: Invalid input }
+    Unauthorized: { description: Authentication required }
+    Forbidden: { description: Authenticated principal cannot manage the requested agent/resource }
+    NotFound: { description: Resource not found }
