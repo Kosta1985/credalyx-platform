@@ -1,4 +1,5 @@
 import { and, eq, gt, isNull, sql as drizzleSql } from 'drizzle-orm';
+import type { TransactionSql } from 'postgres';
 import {
   assertBalancedEntries,
   commissionReleaseEntries,
@@ -254,7 +255,7 @@ export class PostgresPlatformStore implements PlatformStore {
         id, agent_id, provider, provider_session_id, amount_minor, currency, status,
         expires_at, idempotency_key, purchase_reference, checkout_url
       ) values (
-        ${uuidv7()}, ${input.agentId}, ${input.provider}, ${input.providerSessionId}, ${input.amountMinor},
+        ${uuidv7()}, ${input.agentId}, ${input.provider}, ${input.providerSessionId}, ${input.amountMinor.toString()},
         ${input.currency}, ${input.status}, ${input.expiresAt}, ${input.idempotencyKey},
         ${input.purchaseReference}, ${input.checkoutUrl}
       )
@@ -347,6 +348,11 @@ export class PostgresPlatformStore implements PlatformStore {
       if (!currentAgent[0] || currentAgent[0].verificationLevel < 1 || !currentAgent[0].controlVerifiedAt) {
         throw new Error('agent control is not verified');
       }
+
+      const activePassport = await tx.select({ id: agentPassports.id }).from(agentPassports)
+        .where(and(eq(agentPassports.agentId, input.agent.id), eq(agentPassports.status, 'active'), gt(agentPassports.expiresAt, receivedAt)))
+        .limit(1);
+      if (activePassport[0]) throw new Error('agent already has an active passport');
 
       const paymentEventId = uuidv7();
       await tx.insert(paymentEvents).values({
@@ -503,12 +509,12 @@ export class PostgresPlatformStore implements PlatformStore {
       if (input.kind === 'refund') {
         await tx`
           insert into refunds (id, purchase_id, provider_refund_id, amount_minor, currency, status, provider, provider_event_id, reason_code, created_at)
-          values (${uuidv7()}, ${purchase.purchase_internal_id}, ${input.eventId}, ${priceMinor}, ${purchase.currency}, 'succeeded', ${input.provider}, ${input.eventId}, ${input.reasonCode}, ${input.occurredAt})
+          values (${uuidv7()}, ${purchase.purchase_internal_id}, ${input.eventId}, ${priceMinor.toString()}, ${purchase.currency}, 'succeeded', ${input.provider}, ${input.eventId}, ${input.reasonCode}, ${input.occurredAt})
         `;
       } else {
         await tx`
           insert into disputes (id, purchase_id, provider_dispute_id, amount_minor, currency, status, provider, provider_event_id, reason_code, created_at)
-          values (${uuidv7()}, ${purchase.purchase_internal_id}, ${input.eventId}, ${priceMinor}, ${purchase.currency}, 'lost', ${input.provider}, ${input.eventId}, ${input.reasonCode}, ${input.occurredAt})
+          values (${uuidv7()}, ${purchase.purchase_internal_id}, ${input.eventId}, ${priceMinor.toString()}, ${purchase.currency}, 'lost', ${input.provider}, ${input.eventId}, ${input.reasonCode}, ${input.occurredAt})
         `;
       }
 
@@ -521,7 +527,7 @@ export class PostgresPlatformStore implements PlatformStore {
         const accountId = await ensureRawLedgerAccount(tx, entry.account, entry.scopeType, entry.scopeId);
         await tx`
           insert into ledger_entries (id, transaction_id, account_id, amount_minor, currency)
-          values (${uuidv7()}, ${ledgerTxId}, ${accountId}, ${entry.amountMinor}, ${entry.currency})
+          values (${uuidv7()}, ${ledgerTxId}, ${accountId}, ${entry.amountMinor.toString()}, ${entry.currency})
         `;
       }
       await tx`update ledger_transactions set sealed_at = ${input.occurredAt} where id = ${ledgerTxId}`;
@@ -582,7 +588,7 @@ export class PostgresPlatformStore implements PlatformStore {
           const accountId = await ensureRawLedgerAccount(tx, entry.account, entry.scopeType, entry.scopeId);
           await tx`
             insert into ledger_entries (id, transaction_id, account_id, amount_minor, currency)
-            values (${uuidv7()}, ${ledgerTxId}, ${accountId}, ${entry.amountMinor}, ${entry.currency})
+            values (${uuidv7()}, ${ledgerTxId}, ${accountId}, ${entry.amountMinor.toString()}, ${entry.currency})
           `;
         }
         await tx`update ledger_transactions set sealed_at = ${now} where id = ${ledgerTxId}`;
@@ -738,7 +744,7 @@ function accountTypeFor(account: LedgerAccount): string {
 }
 
 async function ensureRawLedgerAccount(
-  tx: Parameters<Parameters<ReturnType<typeof createDatabase>['client']['begin']>[0]>[0],
+  tx: TransactionSql<{}>,
   code: LedgerAccount,
   scopeType: 'platform' | 'agent',
   scopeId: string,
