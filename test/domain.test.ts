@@ -59,7 +59,8 @@ test('active signed passport verifies and revoked passport does not', () => {
 
 test('passport requires verified control', () => {
   const signer = PassportSigner.ephemeral();
-  assert.throws(() => signer.issue({ ...agent, verificationLevel: 0, controlVerifiedAt: undefined }), /control/);
+  const { controlVerifiedAt: _controlVerifiedAt, ...unverified } = agent;
+  assert.throws(() => signer.issue({ ...unverified, verificationLevel: 0 }), /control/);
 });
 
 test('ledger rejects an unbalanced transaction', () => {
