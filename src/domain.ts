@@ -5,6 +5,8 @@ export type Currency = 'USD';
 export type VerificationLevel = 0 | 1 | 2 | 3;
 export type AgentStatus = 'pending' | 'active' | 'suspended' | 'revoked';
 export type PassportStatus = 'active' | 'suspended' | 'revoked' | 'expired';
+export type CommissionStatus = 'pending' | 'available' | 'paid' | 'reversed';
+export type ReversalKind = 'refund' | 'chargeback';
 
 export interface AgentRecord {
   id: string;
@@ -185,18 +187,58 @@ export function passportSaleEntries(priceMinor: bigint, referralCommissionMinor:
   return entries;
 }
 
-export function passportRefundEntries(priceMinor: bigint, referralCommissionMinor: bigint, referrerAgentId?: string): LedgerEntry[] {
-  if (priceMinor <= 0n) throw new Error('price must be positive');
+export function commissionReleaseEntries(amountMinor: bigint, referrerAgentId: string): LedgerEntry[] {
+  if (amountMinor <= 0n) throw new Error('commission amount must be positive');
   const entries: LedgerEntry[] = [
-    { account: 'refunds', scopeType: 'platform', scopeId: 'platform', amountMinor: priceMinor, currency: 'USD' },
-    { account: 'payment_provider_clearing', scopeType: 'platform', scopeId: 'platform', amountMinor: -priceMinor, currency: 'USD' },
+    { account: 'agent_owner_pending_balance', scopeType: 'agent', scopeId: referrerAgentId, amountMinor, currency: 'USD' },
+    { account: 'agent_owner_available_balance', scopeType: 'agent', scopeId: referrerAgentId, amountMinor: -amountMinor, currency: 'USD' },
   ];
-  if (referrerAgentId && referralCommissionMinor > 0n) {
+  assertBalancedEntries(entries);
+  return entries;
+}
+
+export function passportReversalEntries(input: {
+  kind: ReversalKind;
+  priceMinor: bigint;
+  referralCommissionMinor: bigint;
+  referrerAgentId?: string;
+  commissionStatus?: CommissionStatus;
+}): LedgerEntry[] {
+  if (input.priceMinor <= 0n) throw new Error('price must be positive');
+  if (input.referralCommissionMinor < 0n) throw new Error('commission cannot be negative');
+  const expenseAccount: LedgerAccount = input.kind === 'refund' ? 'refunds' : 'chargebacks';
+  const entries: LedgerEntry[] = [
+    { account: expenseAccount, scopeType: 'platform', scopeId: 'platform', amountMinor: input.priceMinor, currency: 'USD' },
+    { account: 'payment_provider_clearing', scopeType: 'platform', scopeId: 'platform', amountMinor: -input.priceMinor, currency: 'USD' },
+  ];
+  if (input.referrerAgentId && input.referralCommissionMinor > 0n && input.commissionStatus !== 'reversed') {
+    const balanceAccount: LedgerAccount = input.commissionStatus === 'pending'
+      ? 'agent_owner_pending_balance'
+      : 'agent_owner_available_balance';
     entries.push(
-      { account: 'agent_owner_pending_balance', scopeType: 'agent', scopeId: referrerAgentId, amountMinor: referralCommissionMinor, currency: 'USD' },
-      { account: 'refunds', scopeType: 'platform', scopeId: 'platform', amountMinor: -referralCommissionMinor, currency: 'USD' },
+      { account: balanceAccount, scopeType: 'agent', scopeId: input.referrerAgentId, amountMinor: input.referralCommissionMinor, currency: 'USD' },
+      { account: expenseAccount, scopeType: 'platform', scopeId: 'platform', amountMinor: -input.referralCommissionMinor, currency: 'USD' },
     );
   }
+  assertBalancedEntries(entries);
+  return entries;
+}
+
+export function passportRefundEntries(priceMinor: bigint, referralCommissionMinor: bigint, referrerAgentId?: string): LedgerEntry[] {
+  return passportReversalEntries({
+    kind: 'refund',
+    priceMinor,
+    referralCommissionMinor,
+    ...(referrerAgentId ? { referrerAgentId, commissionStatus: 'pending' as const } : {}),
+  });
+}
+
+export function payoutEntries(amountMinor: bigint, referrerAgentId: string): LedgerEntry[] {
+  if (amountMinor <= 0n) throw new Error('payout amount must be positive');
+  const entries: LedgerEntry[] = [
+    { account: 'agent_owner_available_balance', scopeType: 'agent', scopeId: referrerAgentId, amountMinor, currency: 'USD' },
+    { account: 'payment_provider_clearing', scopeType: 'platform', scopeId: 'platform', amountMinor: -amountMinor, currency: 'USD' },
+  ];
   assertBalancedEntries(entries);
   return entries;
 }
