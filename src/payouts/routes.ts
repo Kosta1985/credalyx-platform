@@ -7,7 +7,7 @@ import type { AgentRecord } from '../domain.js';
 import type { PlatformStore } from '../store.js';
 import type { PayoutProvider } from './provider.js';
 import { assessPayoutRisk } from './risk.js';
-import type { PayoutRecord, PayoutStore } from './store.js';
+import type { PayoutAccountRecord, PayoutRecord, PayoutStore } from './store.js';
 
 export interface PayoutRouteConfig {
   publicBaseUrl: string;
@@ -88,6 +88,31 @@ export function registerPayoutRoutes(deps: PayoutRouteDependencies): void {
     return agent;
   }
 
+  async function submitReservedPayout(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    payout: PayoutRecord,
+    account: PayoutAccountRecord,
+    idempotencyKey: string,
+  ): Promise<PayoutRecord | undefined> {
+    if (payout.status !== 'pending') return payout;
+    try {
+      const providerPayout = await deps.provider.createPayout({
+        payoutReference: payout.payoutReference,
+        providerAccountId: account.providerAccountId,
+        amountMinor: payout.amountMinor,
+        currency: payout.currency,
+        idempotencyKey,
+      });
+      return deps.store.markSubmitted(payout.payoutReference, providerPayout, new Date());
+    } catch (error) {
+      request.log.error({ err: error }, 'payout provider submission failed');
+      const failed = await deps.store.failSubmission(payout.payoutReference, 'provider_submission_error', new Date());
+      await reply.code(502).send({ code: 'PAYOUT_PROVIDER_SUBMISSION_FAILED', payout: serializePayout(failed) });
+      return undefined;
+    }
+  }
+
   app.post('/v1/payouts/onboarding', async (request, reply) => {
     const parsed = onboardingSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ code: 'VALIDATION_ERROR' });
@@ -143,6 +168,28 @@ export function registerPayoutRoutes(deps: PayoutRouteDependencies): void {
       return reply.code(400).send({ code: 'IDEMPOTENCY_KEY_REQUIRED' });
     }
     const idempotencyKey = namespaceKey(agent.id, clientKey, 'payout');
+    const payoutReference = createPayoutReference(agent.id, clientKey);
+
+    // Resolve the deterministic idempotent result before evaluating the current
+    // risk context. A retry must never be rejected merely because its original
+    // payout is now the open payout that the risk engine observes.
+    const existing = await deps.store.getPayout(payoutReference);
+    if (existing) {
+      if (existing.agentId !== agent.id || existing.amountMinor !== amountMinor || existing.currency !== 'USD') {
+        return reply.code(409).send({ code: 'PAYOUT_IDEMPOTENCY_CONFLICT' });
+      }
+      const account = await deps.store.getPayoutAccount(agent, deps.provider.name);
+      if (existing.status === 'pending') {
+        if (!account || account.onboardingStatus !== 'complete') {
+          return reply.code(409).send({ code: 'PAYOUT_ACCOUNT_UNAVAILABLE_FOR_RETRY' });
+        }
+        const submitted = await submitReservedPayout(request, reply, existing, account, idempotencyKey);
+        if (!submitted) return;
+        return reply.code(200).send({ payout: serializePayout(submitted) });
+      }
+      return reply.code(200).send({ payout: serializePayout(existing) });
+    }
+
     const account = await deps.store.getPayoutAccount(agent, deps.provider.name);
     const context = await deps.store.getRiskContext(agent.id, new Date());
     const assessment = assessPayoutRisk({
@@ -160,17 +207,10 @@ export function registerPayoutRoutes(deps: PayoutRouteDependencies): void {
       maxPayoutsPer24h: deps.config.maxPayoutsPer24h,
     });
     await deps.store.recordRiskAssessment(agent.id, idempotencyKey, amountMinor, 'USD', assessment, new Date());
-    if (!account) {
-      return reply.code(409).send({ code: 'PAYOUT_ONBOARDING_REQUIRED', risk: assessment });
-    }
-    if (assessment.decision === 'deny') {
-      return reply.code(409).send({ code: 'PAYOUT_DENIED', risk: assessment });
-    }
-    if (assessment.decision === 'review') {
-      return reply.code(409).send({ code: 'PAYOUT_REQUIRES_REVIEW', risk: assessment });
-    }
+    if (!account) return reply.code(409).send({ code: 'PAYOUT_ONBOARDING_REQUIRED', risk: assessment });
+    if (assessment.decision === 'deny') return reply.code(409).send({ code: 'PAYOUT_DENIED', risk: assessment });
+    if (assessment.decision === 'review') return reply.code(409).send({ code: 'PAYOUT_REQUIRES_REVIEW', risk: assessment });
 
-    const payoutReference = createPayoutReference(agent.id, clientKey);
     let reservation;
     try {
       reservation = await deps.store.reservePayout({
@@ -188,24 +228,23 @@ export function registerPayoutRoutes(deps: PayoutRouteDependencies): void {
       return reply.code(409).send({ code: 'PAYOUT_RESERVATION_REJECTED' });
     }
 
-    let payout = reservation.payout;
-    if (payout.status === 'pending') {
-      try {
-        const providerPayout = await deps.provider.createPayout({
-          payoutReference: payout.payoutReference,
-          providerAccountId: account.providerAccountId,
-          amountMinor: payout.amountMinor,
-          currency: payout.currency,
-          idempotencyKey,
-        });
-        payout = await deps.store.markSubmitted(payout.payoutReference, providerPayout, new Date());
-      } catch (error) {
-        request.log.error({ err: error }, 'payout provider submission failed');
-        payout = await deps.store.failSubmission(payout.payoutReference, 'provider_submission_error', new Date());
-        return reply.code(502).send({ code: 'PAYOUT_PROVIDER_SUBMISSION_FAILED', payout: serializePayout(payout) });
-      }
-    }
-    return reply.code(reservation.duplicate ? 200 : 201).send({ payout: serializePayout(payout) });
+    const submitted = await submitReservedPayout(request, reply, reservation.payout, account, idempotencyKey);
+    if (!submitted) return;
+    return reply.code(reservation.duplicate ? 200 : 201).send({ payout: serializePayout(submitted) });
+  });
+
+  app.get('/v1/payouts/summary', async (request, reply) => {
+    const query = z.object({ agent_id: z.string().min(1).max(255) }).safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ code: 'VALIDATION_ERROR' });
+    const agent = await ownedAgent(request, reply, query.data.agent_id);
+    if (!agent) return;
+    const summary = await deps.store.getPayoutSummary(agent.id);
+    return {
+      currency: 'USD',
+      reserved_minor: summary.reservedMinor.toString(),
+      paid_minor: summary.paidMinor.toString(),
+      open_payout_count: summary.openPayoutCount,
+    };
   });
 
   app.get('/v1/payouts', async (request, reply) => {
