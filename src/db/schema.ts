@@ -119,6 +119,7 @@ export const agentPassports = pgTable('agent_passports', {
   id: uuid('id').primaryKey(),
   passportId: text('passport_id').notNull().unique(),
   agentId: uuid('agent_id').notNull().references(() => agents.id),
+  purchaseId: uuid('purchase_id').references(() => purchases.id),
   schemaVersion: text('schema_version').notNull(),
   claims: jsonb('claims').notNull(),
   signature: text('signature').notNull(),
@@ -126,7 +127,9 @@ export const agentPassports = pgTable('agent_passports', {
   issuedAt: timestamptz('issued_at').notNull(),
   expiresAt: timestamptz('expires_at').notNull(),
   createdAt: timestamptz('created_at').notNull().defaultNow(),
-});
+}, (table) => [
+  uniqueIndex('agent_passports_purchase_unique').on(table.purchaseId).where(sql`${table.purchaseId} is not null`),
+]);
 
 export const passportStatusHistory = pgTable('passport_status_history', {
   id: uuid('id').primaryKey(),
@@ -191,12 +194,19 @@ export const paymentSessions = pgTable('payment_sessions', {
   agentId: uuid('agent_id').notNull().references(() => agents.id),
   provider: text('provider').notNull(),
   providerSessionId: text('provider_session_id').notNull(),
+  idempotencyKey: text('idempotency_key'),
+  purchaseReference: text('purchase_reference'),
+  checkoutUrl: text('checkout_url'),
   amountMinor: bigint('amount_minor', { mode: 'bigint' }).notNull(),
   currency: text('currency').notNull(),
   status: text('status').notNull(),
   expiresAt: timestamptz('expires_at'),
   createdAt: timestamptz('created_at').notNull().defaultNow(),
-}, (table) => [uniqueIndex('payment_sessions_provider_unique').on(table.provider, table.providerSessionId)]);
+}, (table) => [
+  uniqueIndex('payment_sessions_provider_unique').on(table.provider, table.providerSessionId),
+  uniqueIndex('payment_sessions_idempotency_unique').on(table.provider, table.idempotencyKey).where(sql`${table.idempotencyKey} is not null`),
+  uniqueIndex('payment_sessions_purchase_reference_unique').on(table.purchaseReference).where(sql`${table.purchaseReference} is not null`),
+]);
 
 export const paymentEvents = pgTable('payment_events', {
   id: uuid('id').primaryKey(),
@@ -254,6 +264,9 @@ export const commissions = pgTable('commissions', {
   currency: text('currency').notNull(),
   status: commissionStatus('status').notNull().default('pending'),
   holdUntil: timestamptz('hold_until').notNull(),
+  releasedAt: timestamptz('released_at'),
+  reversedAt: timestamptz('reversed_at'),
+  reversalReason: text('reversal_reason'),
   createdAt: timestamptz('created_at').notNull().defaultNow(),
   updatedAt: timestamptz('updated_at').notNull().defaultNow(),
 });
@@ -282,21 +295,33 @@ export const refunds = pgTable('refunds', {
   id: uuid('id').primaryKey(),
   purchaseId: uuid('purchase_id').notNull().references(() => purchases.id),
   providerRefundId: text('provider_refund_id'),
+  provider: text('provider'),
+  providerEventId: text('provider_event_id'),
+  reasonCode: text('reason_code'),
   amountMinor: bigint('amount_minor', { mode: 'bigint' }).notNull(),
   currency: text('currency').notNull(),
   status: text('status').notNull(),
   createdAt: timestamptz('created_at').notNull().defaultNow(),
-});
+}, (table) => [
+  uniqueIndex('refunds_provider_event_unique').on(table.provider, table.providerEventId)
+    .where(sql`${table.provider} is not null and ${table.providerEventId} is not null`),
+]);
 
 export const disputes = pgTable('disputes', {
   id: uuid('id').primaryKey(),
   purchaseId: uuid('purchase_id').notNull().references(() => purchases.id),
   providerDisputeId: text('provider_dispute_id').notNull().unique(),
+  provider: text('provider'),
+  providerEventId: text('provider_event_id'),
+  reasonCode: text('reason_code'),
   amountMinor: bigint('amount_minor', { mode: 'bigint' }).notNull(),
   currency: text('currency').notNull(),
   status: text('status').notNull(),
   createdAt: timestamptz('created_at').notNull().defaultNow(),
-});
+}, (table) => [
+  uniqueIndex('disputes_provider_event_unique').on(table.provider, table.providerEventId)
+    .where(sql`${table.provider} is not null and ${table.providerEventId} is not null`),
+]);
 
 export const webhookEvents = pgTable('webhook_events', {
   id: uuid('id').primaryKey(),
