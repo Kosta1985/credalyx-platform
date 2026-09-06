@@ -20,7 +20,7 @@ import { registerCredentialRoutes } from './credentials/routes.js';
 import { PostgresCredentialLifecycleStore } from './credentials/store-postgres.js';
 import type { CredentialLifecycleStore } from './credentials/store.js';
 import { assertReferralAllowed, passportSaleEntries, PassportSigner, type AgentRecord } from './domain.js';
-import { PostgresPlatformStore } from './db/store-postgres.js';
+import { PostgresLifecyclePlatformStore } from './db/store-postgres-lifecycle.js';
 import type { PaymentProvider } from './payments/provider.js';
 import { SandboxPaymentProvider } from './payments/sandbox.js';
 import type { PlatformStore } from './store.js';
@@ -224,6 +224,9 @@ export async function buildApp(deps: AppDependencies) {
     const agent = await deps.store.getAgent(agentId);
     if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
     if (!canManageAgent(principal, agent)) return reply.code(403).send({ code: 'TENANT_ACCESS_DENIED' });
+    if (agent.status === 'suspended' || agent.status === 'revoked') {
+      return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_CONTROL_CHALLENGE', status: agent.status });
+    }
     const challenge = createChallenge();
     const digest = challengeDigest(challenge);
     const expiresAt = new Date(Date.now() + 120_000);
@@ -255,6 +258,9 @@ export async function buildApp(deps: AppDependencies) {
     const agent = await deps.store.getAgent(agentId);
     if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
     if (!canManageAgent(principal, agent)) return reply.code(403).send({ code: 'TENANT_ACCESS_DENIED' });
+    if (agent.status === 'suspended' || agent.status === 'revoked') {
+      return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_CONTROL_VERIFICATION', status: agent.status });
+    }
     const body = verifyControlSchema.safeParse(request.body);
     if (!body.success) return reply.code(400).send({ code: 'VALIDATION_ERROR' });
     let publicKeyPem = agent.publicKeyPem;
@@ -297,6 +303,9 @@ export async function buildApp(deps: AppDependencies) {
     const agent = await deps.store.getAgent(agentId);
     if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
     if (!canManageAgent(principal, agent)) return reply.code(403).send({ code: 'TENANT_ACCESS_DENIED' });
+    if (agent.status === 'suspended' || agent.status === 'revoked') {
+      return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_PASSPORT', status: agent.status });
+    }
     if (agent.verificationLevel < 1 || !agent.controlVerifiedAt) return reply.code(409).send({ code: 'AGENT_CONTROL_NOT_VERIFIED' });
     const activePassport = await deps.store.getActivePassportForAgent(agent.id);
     if (activePassport) {
@@ -365,6 +374,9 @@ export async function buildApp(deps: AppDependencies) {
       if (session.amountMinor !== deps.config.passportPriceMinor) return reply.code(409).send({ code: 'PAYMENT_PRICE_POLICY_MISMATCH' });
       const agent = await deps.store.getAgent(event.agent_id);
       if (!agent) return reply.code(404).send({ code: 'AGENT_NOT_FOUND' });
+      if (agent.status === 'suspended' || agent.status === 'revoked') {
+        return reply.code(409).send({ code: 'AGENT_NOT_ELIGIBLE_FOR_PASSPORT', status: agent.status });
+      }
       if (agent.verificationLevel < 1 || !agent.controlVerifiedAt) return reply.code(409).send({ code: 'AGENT_CONTROL_NOT_VERIFIED' });
       const passport = deps.signer.issue(agent, deps.config.passportTtlDays);
       const ledgerEntries = passportSaleEntries(deps.config.passportPriceMinor, deps.config.referralCommissionMinor, agent.referrerAgentId);
@@ -578,7 +590,7 @@ async function startServer(): Promise<void> {
     audience: config.AUTH_JWT_AUDIENCE,
   });
   const app = await buildApp({
-    store: new PostgresPlatformStore(config.DATABASE_URL),
+    store: new PostgresLifecyclePlatformStore(config.DATABASE_URL),
     credentials: new PostgresCredentialLifecycleStore(config.DATABASE_URL),
     signer,
     authenticate,
