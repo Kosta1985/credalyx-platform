@@ -13,6 +13,7 @@ export interface AgentRecord {
   publicId: string;
   ownerSubject: string;
   organizationId?: string;
+  keyId: string;
   publicKeyPem: string;
   capabilities: string[];
   endpoint: string;
@@ -26,6 +27,7 @@ export interface AgentRecord {
 
 export interface AgentPassportClaims {
   passport_id: string;
+  passport_version: number;
   agent_id: string;
   issuer: string;
   subject: string;
@@ -121,16 +123,19 @@ export class PassportSigner {
     });
   }
 
-  issue(agent: AgentRecord, ttlDays = 30): SignedPassport {
+  issue(agent: AgentRecord, ttlDays = 30, passportVersion = 1, preserveExpiresAt?: Date): SignedPassport {
     if (agent.verificationLevel < 1 || !agent.controlVerifiedAt) {
       throw new Error('agent control must be verified before passport issuance');
     }
     if (agent.status === 'revoked' || agent.status === 'suspended') throw new Error('agent is not eligible for passport issuance');
+    if (!Number.isInteger(passportVersion) || passportVersion < 1) throw new Error('passport version must be a positive integer');
     const issued = new Date();
-    const expires = new Date(issued.getTime() + ttlDays * 86_400_000);
+    const expires = preserveExpiresAt ?? new Date(issued.getTime() + ttlDays * 86_400_000);
+    if (expires.getTime() <= issued.getTime()) throw new Error('passport expiry must be in the future');
     const passportId = uuidv7();
     const claims: AgentPassportClaims = {
       passport_id: passportId,
+      passport_version: passportVersion,
       agent_id: agent.publicId,
       issuer: this.issuer,
       subject: `agent:${agent.publicId}`,
@@ -138,7 +143,7 @@ export class PassportSigner {
       capabilities: [...agent.capabilities].sort(),
       issued_at: issued.toISOString(),
       expires_at: expires.toISOString(),
-      public_key_reference: `${this.issuer}/v1/agents/${agent.publicId}/keys/current`,
+      public_key_reference: `${this.issuer}/v1/agents/${agent.publicId}/keys/${encodeURIComponent(agent.keyId)}`,
       status_reference: `${this.issuer}/v1/passports/${passportId}/status`,
       schema_version: '1.0',
     };
