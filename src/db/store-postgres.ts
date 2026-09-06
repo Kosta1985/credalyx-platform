@@ -25,6 +25,7 @@ import {
 } from './schema.js';
 
 const MANAGE_ROLES = new Set(['owner', 'admin', 'developer']);
+type DbExecutor = Pick<Database, 'select' | 'insert'>;
 
 export class PostgresPlatformStore implements PlatformStore {
   private readonly client: ReturnType<typeof createDatabase>['client'];
@@ -36,7 +37,7 @@ export class PostgresPlatformStore implements PlatformStore {
     this.db = connection.db;
   }
 
-  private async ensureUser(tx: Database, externalSubject: string): Promise<string> {
+  private async ensureUser(tx: DbExecutor, externalSubject: string): Promise<string> {
     const existing = await tx.select({ id: users.id }).from(users).where(eq(users.externalSubject, externalSubject)).limit(1);
     if (existing[0]) return existing[0].id;
     const id = uuidv7();
@@ -46,7 +47,7 @@ export class PostgresPlatformStore implements PlatformStore {
     return resolved[0].id;
   }
 
-  private async assertOrganizationAccess(tx: Database, userId: string, organizationId?: string): Promise<void> {
+  private async assertOrganizationAccess(tx: DbExecutor, userId: string, organizationId?: string): Promise<void> {
     if (!organizationId) return;
     const memberships = await tx.select({ role: organizationMembers.role })
       .from(organizationMembers)
@@ -62,8 +63,8 @@ export class PostgresPlatformStore implements PlatformStore {
 
   async createAgent(agent: AgentRecord): Promise<void> {
     await this.db.transaction(async (tx) => {
-      const ownerUserId = await this.ensureUser(tx as Database, agent.ownerSubject);
-      await this.assertOrganizationAccess(tx as Database, ownerUserId, agent.organizationId);
+      const ownerUserId = await this.ensureUser(tx, agent.ownerSubject);
+      await this.assertOrganizationAccess(tx, ownerUserId, agent.organizationId);
       await tx.insert(agents).values({
         id: agent.id,
         publicId: agent.publicId,
@@ -97,11 +98,16 @@ export class PostgresPlatformStore implements PlatformStore {
         })));
       }
       if (agent.referrerAgentId) {
+        const referrer = await tx.select({ referralCode: agents.referralCode })
+          .from(agents)
+          .where(eq(agents.id, agent.referrerAgentId))
+          .limit(1);
+        if (!referrer[0]) throw new Error('referrer agent not found');
         await tx.insert(referrals).values({
           id: uuidv7(),
           referredAgentId: agent.id,
           referrerAgentId: agent.referrerAgentId,
-          referralCode: 'attributed',
+          referralCode: referrer[0].referralCode,
         });
       }
       await tx.insert(auditEvents).values({
@@ -208,7 +214,7 @@ export class PostgresPlatformStore implements PlatformStore {
     });
   }
 
-  private async ensureLedgerAccount(tx: Database, code: LedgerAccount, scopeType: 'platform' | 'agent', scopeId: string): Promise<string> {
+  private async ensureLedgerAccount(tx: DbExecutor, code: LedgerAccount, scopeType: 'platform' | 'agent', scopeId: string): Promise<string> {
     const existing = await tx.select({ id: ledgerAccounts.id }).from(ledgerAccounts).where(and(eq(ledgerAccounts.code, code), eq(ledgerAccounts.scopeType, scopeType), eq(ledgerAccounts.scopeId, scopeId))).limit(1);
     if (existing[0]) return existing[0].id;
     const id = uuidv7();
@@ -232,9 +238,11 @@ export class PostgresPlatformStore implements PlatformStore {
       }).onConflictDoNothing({ target: [webhookEvents.provider, webhookEvents.providerEventId] }).returning({ id: webhookEvents.id });
       if (!webhookRow[0]) return { duplicate: true };
 
-      const existingPurchase = await tx.select({ id: purchases.id }).from(purchases).where(eq(purchases.externalReference, input.purchaseId)).limit(1);
+      const existingPurchase = await tx.select({ id: purchases.id }).from(purchases)
+        .where(eq(purchases.externalReference, input.purchaseId)).limit(1);
       if (existingPurchase[0]) {
-        await tx.update(webhookEvents).set({ processingStatus: 'duplicate', processedAt: receivedAt }).where(eq(webhookEvents.id, webhookRow[0].id));
+        await tx.update(webhookEvents).set({ processingStatus: 'duplicate', processedAt: receivedAt })
+          .where(eq(webhookEvents.id, webhookRow[0].id));
         return { duplicate: true };
       }
 
@@ -291,7 +299,7 @@ export class PostgresPlatformStore implements PlatformStore {
         transactionType: 'passport_sale',
       });
       for (const entry of input.ledgerEntries) {
-        const accountId = await this.ensureLedgerAccount(tx as Database, entry.account, entry.scopeType, entry.scopeId);
+        const accountId = await this.ensureLedgerAccount(tx, entry.account, entry.scopeType, entry.scopeId);
         await tx.insert(ledgerEntries).values({
           id: uuidv7(),
           transactionId: ledgerTxId,
