@@ -1,43 +1,71 @@
-# Threat Model — Phase 1
+# Threat Model
 
-## Primary assets
+## Assets
 
-- Agent signing identity and key references.
-- Passport issuer keys and signed passports.
-- Organization membership and authorization state.
-- Payment event integrity.
-- Ledger correctness and payout liabilities.
-- Referral attribution.
-- Audit evidence.
+- agent identity and key state;
+- passport signing authority;
+- verification decisions/evidence references;
+- payment event integrity;
+- immutable ledger history;
+- referral attribution and payout entitlement;
+- tenant/private owner data;
+- administrative audit history.
 
-## Priority threats and controls
+## Primary threats and current controls
 
-| Threat | Impact | Initial controls |
-| --- | --- | --- |
-| Replay of agent challenge/request | Agent impersonation | Random challenges, expiry, one-time consumption, timestamp/nonce design |
-| Stolen static API key treated as identity | Agent impersonation | Challenge-response with asymmetric signatures; API keys never prove agent identity |
-| Forged payment success | Free passport / fraudulent commission | Server-side provider webhook verification, event idempotency, no frontend authority |
-| Duplicate webhook | Double issuance / accounting duplication | Provider event dedupe + ledger idempotency keys |
-| Ledger imbalance | Financial misstatement | Per-currency zero-sum invariant, immutable entries, compensating corrections |
-| Referral self-dealing / rings | Fraudulent payouts | Self-referral prohibition, immutable attribution, graph/risk signals, velocity/device/IP controls |
-| Passport replay after revocation | Unauthorized trust | Online status/revocation reference and verifier status checks |
-| Tenant breakout | Confidentiality breach | Membership-derived organization scope, authorization matrix tests, RLS where useful |
-| Admin account takeover | High-impact fraud | Phishing-resistant MFA, least privilege, privileged-action audit log |
-| Issuer-key compromise | Ecosystem compromise | KMS/HSM-backed keys, rotation, versioned key IDs, incident revocation process |
-| SSRF through agent endpoints | Infrastructure compromise | HTTPS-only endpoint policy, egress filtering, DNS/IP validation, no unrestricted fetch |
-| Secret leakage in logs/CI | Credential compromise | Structured redaction, secret scanning, no production secrets in repo/tests |
+### Agent impersonation
+Threat: attacker registers or presents an API key and claims control of another agent.
+Controls: Ed25519 key validation, proof-of-possession challenge, agent-bound signed payload, single-use/expiry, key reference in passport.
 
-## Abuse cases requiring dedicated tests
+### Challenge replay / race
+Threat: reuse a previously valid proof or submit concurrent verification calls.
+Controls: hashed challenges, expiry, atomic consume condition in PostgreSQL, signature verified before challenge consume.
 
-- Same payment event delivered concurrently multiple times.
-- Two payout requests racing against one available balance.
-- Refund racing with commission release.
-- Cyclic referral graph attempts.
-- Owner attempting to access another organization's agent.
-- Revoked key continuing to authenticate requests.
-- Modified passport claims with original signature.
-- Payment webhook with valid JSON but invalid signature.
+### Tenant breakout / IDOR
+Threat: authenticated owner mutates another owner/organization's agent.
+Controls: owner subject bound from trusted auth adapter; organization ID is authorization-checked; resource mutation re-checks ownership.
+Remaining: persist and enforce full organization membership matrix for every upcoming endpoint.
 
-## Regulatory/operational boundary
+### Forged or stale passport
+Threat: fabricated credential or revoked passport remains trusted.
+Controls: Ed25519 signature, issuer binding, expiry, public live status, revocation history.
+Remaining: managed issuer-key rotation and public key-version discovery.
 
-CREDALYX must not present the Agent Passport as state-issued identity, accreditation or regulatory approval. Real payment processing, recipient onboarding and payouts must remain with an appropriately licensed provider. Legal conclusions on stored value, referral rewards, sanctions, tax and country restrictions require jurisdiction-specific professional review before production launch.
+### Webhook forgery/replay
+Threat: frontend calls payment-success route or repeats a real provider event.
+Controls: no frontend payment confirmation; sandbox timestamped HMAC; provider/event unique idempotency; purchase/ledger transaction in DB transaction.
+Remaining: implement raw-body verification per selected real provider.
+
+### Ledger tampering
+Threat: edit/delete historical finance rows or append later entries to alter a past transaction.
+Controls: minor-unit integers; application balance checks; PostgreSQL one-time sealing balance check; sealed entry insert guard; UPDATE/DELETE triggers; idempotency key.
+
+### Referral abuse
+Threat: self-referral, same-owner farming, repeated refunds, synthetic agent farms.
+Controls: common-owner self-referral rejection, single attribution record, locked attribution at purchase, pending commission status and hold timestamp.
+Remaining: IP/device/velocity signals, graph/ring detection, refund/chargeback reversal, payout onboarding/risk review.
+
+### SSRF through agent endpoint
+Threat: platform probes internal/cloud metadata endpoint supplied by owner.
+Controls now: registration stores endpoint only and requires HTTPS in production; no server-side fetch exists yet.
+Required before endpoint probing: DNS/IP resolution policy, private/link-local/metadata deny list, redirect revalidation, egress proxy and response limits.
+
+### Key compromise
+Threat: issuer or agent private key stolen.
+Controls: no private agent keys stored; production refuses ephemeral issuer key configuration.
+Remaining: KMS/HSM issuer operations, key versioning, rotation and emergency revocation runbook.
+
+## Abuse cases to test continuously
+
+- wrong-key agent signature;
+- valid signature bound to wrong agent ID;
+- expired/replayed challenge;
+- cross-tenant mutation;
+- duplicate payment event;
+- payment amount mismatch;
+- unbalanced ledger transaction;
+- append to sealed ledger transaction;
+- revoked passport verification;
+- same-owner referral;
+- refund after commission becomes pending/available;
+- simultaneous refund and payout attempts.
