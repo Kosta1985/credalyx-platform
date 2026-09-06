@@ -1,14 +1,14 @@
 {
   "name": "@credalyx/agent-passport-network",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "engines": { "node": ">=24" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test --import tsx 'test/**/*.test.ts'",
-    "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
+    "dev": "tsx watch src/runtime.ts",
+    "start": "node dist/runtime.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:check": "tsx src/db/check.ts",

@@ -53,6 +53,7 @@ export type LedgerAccount =
   | 'referral_commission_payable'
   | 'agent_owner_available_balance'
   | 'agent_owner_pending_balance'
+  | 'agent_owner_reserved_balance'
   | 'refunds'
   | 'chargebacks'
   | 'provider_fees'
@@ -248,12 +249,47 @@ export function passportRefundEntries(priceMinor: bigint, referralCommissionMino
   });
 }
 
+export function payoutReservationEntries(amountMinor: bigint, agentId: string): LedgerEntry[] {
+  assertPayoutAmount(amountMinor);
+  const entries: LedgerEntry[] = [
+    { account: 'agent_owner_available_balance', scopeType: 'agent', scopeId: agentId, amountMinor, currency: 'USD' },
+    { account: 'agent_owner_reserved_balance', scopeType: 'agent', scopeId: agentId, amountMinor: -amountMinor, currency: 'USD' },
+  ];
+  assertBalancedEntries(entries);
+  return entries;
+}
+
+export function payoutSettlementEntries(amountMinor: bigint, agentId: string): LedgerEntry[] {
+  assertPayoutAmount(amountMinor);
+  const entries: LedgerEntry[] = [
+    { account: 'agent_owner_reserved_balance', scopeType: 'agent', scopeId: agentId, amountMinor, currency: 'USD' },
+    { account: 'payment_provider_clearing', scopeType: 'platform', scopeId: 'platform', amountMinor: -amountMinor, currency: 'USD' },
+  ];
+  assertBalancedEntries(entries);
+  return entries;
+}
+
+export function payoutReleaseEntries(amountMinor: bigint, agentId: string): LedgerEntry[] {
+  assertPayoutAmount(amountMinor);
+  const entries: LedgerEntry[] = [
+    { account: 'agent_owner_reserved_balance', scopeType: 'agent', scopeId: agentId, amountMinor, currency: 'USD' },
+    { account: 'agent_owner_available_balance', scopeType: 'agent', scopeId: agentId, amountMinor: -amountMinor, currency: 'USD' },
+  ];
+  assertBalancedEntries(entries);
+  return entries;
+}
+
+/** Legacy direct payout helper retained for compatibility; new payout flow reserves before settlement. */
 export function payoutEntries(amountMinor: bigint, referrerAgentId: string): LedgerEntry[] {
-  if (amountMinor <= 0n) throw new Error('payout amount must be positive');
+  assertPayoutAmount(amountMinor);
   const entries: LedgerEntry[] = [
     { account: 'agent_owner_available_balance', scopeType: 'agent', scopeId: referrerAgentId, amountMinor, currency: 'USD' },
     { account: 'payment_provider_clearing', scopeType: 'platform', scopeId: 'platform', amountMinor: -amountMinor, currency: 'USD' },
   ];
   assertBalancedEntries(entries);
   return entries;
+}
+
+function assertPayoutAmount(amountMinor: bigint): void {
+  if (amountMinor <= 0n) throw new Error('payout amount must be positive');
 }

@@ -9,8 +9,12 @@ const envSchema = z.object({
   REFERRAL_COMMISSION_MINOR: z.coerce.number().int().nonnegative().default(100),
   REFERRAL_HOLD_DAYS: z.coerce.number().int().min(0).max(180).default(30),
   MIN_PAYOUT_MINOR: z.coerce.number().int().positive().default(2500),
+  PAYOUT_AUTO_APPROVE_MAX_MINOR: z.coerce.number().int().positive().default(100_000),
+  PAYOUT_MAX_PER_24H: z.coerce.number().int().min(1).max(50).default(3),
   PASSPORT_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   SANDBOX_WEBHOOK_SECRET: z.string().min(32),
+  SANDBOX_PAYOUT_WEBHOOK_SECRET: z.string().min(32).default('development-only-payout-webhook-secret-0001'),
+  PAYOUT_PROVIDER_BACKEND: z.enum(['sandbox', 'managed']).default('sandbox'),
   PASSPORT_ISSUER_BACKEND: z.enum(['local-pem', 'managed']).default('local-pem'),
   PASSPORT_ISSUER_KEY_REFERENCE: z.string().min(1).optional(),
   PASSPORT_ISSUER_PRIVATE_KEY_PEM: z.string().min(40).optional(),
@@ -31,6 +35,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   if (parsed.MIN_PAYOUT_MINOR < parsed.REFERRAL_COMMISSION_MINOR) {
     throw new Error('MIN_PAYOUT_MINOR must be at least one referral commission');
   }
+  if (parsed.PAYOUT_AUTO_APPROVE_MAX_MINOR < parsed.MIN_PAYOUT_MINOR) {
+    throw new Error('PAYOUT_AUTO_APPROVE_MAX_MINOR must be at least MIN_PAYOUT_MINOR');
+  }
   if (Boolean(parsed.PASSPORT_ISSUER_PRIVATE_KEY_PEM) !== Boolean(parsed.PASSPORT_ISSUER_PUBLIC_KEY_PEM)) {
     throw new Error('local issuer private/public PEM values must be configured together');
   }
@@ -42,12 +49,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     if (parsed.PASSPORT_ISSUER_BACKEND !== 'managed') {
       throw new Error('production requires a managed KMS/HSM-compatible passport issuer backend');
     }
+    if (parsed.PAYOUT_PROVIDER_BACKEND !== 'managed') {
+      throw new Error('production requires a managed payout provider backend');
+    }
     if (!parsed.AUTH_JWT_PUBLIC_KEY_PEM || !parsed.AUTH_JWT_ISSUER || !parsed.AUTH_JWT_AUDIENCE) {
       throw new Error('trusted JWT verification configuration is required in production');
     }
   }
   if (parsed.PASSPORT_ISSUER_BACKEND === 'managed') {
     throw new Error('managed passport issuer backend adapter is not configured in this build');
+  }
+  if (parsed.PAYOUT_PROVIDER_BACKEND === 'managed') {
+    throw new Error('managed payout provider adapter is not configured in this build');
   }
   return parsed;
 }
