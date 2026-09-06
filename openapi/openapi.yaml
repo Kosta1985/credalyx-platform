@@ -1,0 +1,251 @@
+openapi: 3.1.0
+info:
+  title: CREDALYX Agent Passport API
+  version: 0.2.0
+  description: |
+    API for registering AI agents, proving control of an Ed25519 key, issuing and verifying
+    internal CREDALYX Agent Passports, and processing provider-signed payment events.
+    Agent Passports are not government identity documents, licences or regulatory approvals.
+servers:
+  - url: https://api.example.invalid
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      security: []
+      responses:
+        '200': { description: Healthy }
+  /v1/agents:
+    post:
+      summary: Register an agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgentRequest'
+      responses:
+        '201':
+          description: Agent registered
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agent_id, verification_level, referral_code]
+                properties:
+                  agent_id: { type: string }
+                  verification_level: { const: 0 }
+                  referral_code: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/agents/{agent_id}:
+    parameters:
+      - $ref: '#/components/parameters/AgentId'
+    get:
+      security: []
+      summary: Read public agent registry data
+      responses:
+        '200':
+          description: Public agent record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicAgent'
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/agents/{agent_id}/keys/current:
+    parameters:
+      - $ref: '#/components/parameters/AgentId'
+    get:
+      security: []
+      summary: Resolve current agent verification key
+      responses:
+        '200': { description: Current key }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/agents/{agent_id}/challenge:
+    parameters:
+      - $ref: '#/components/parameters/AgentId'
+    post:
+      summary: Create a one-time agent-control challenge
+      responses:
+        '200':
+          description: Challenge and exact signing payload
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challenge, signing_payload, algorithm, expires_at]
+                properties:
+                  challenge: { type: string }
+                  signing_payload: { type: string }
+                  algorithm: { const: Ed25519 }
+                  expires_at: { type: string, format: date-time }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/agents/{agent_id}/verify-control:
+    parameters:
+      - $ref: '#/components/parameters/AgentId'
+    post:
+      summary: Verify Ed25519 proof of agent key possession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challenge, signature]
+              properties:
+                challenge: { type: string }
+                signature:
+                  type: string
+                  description: Base64url Ed25519 signature over signing_payload from the challenge response.
+      responses:
+        '200': { description: Control verified }
+        '401': { description: Invalid signature, expired challenge, or replay }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/webhooks/payment-provider:
+    post:
+      security: []
+      summary: Sandbox payment-provider webhook
+      description: |
+        Sandbox adapter. Production adapters must implement the selected provider's raw-body signature verification.
+      parameters:
+        - in: header
+          name: x-sandbox-timestamp
+          required: true
+          schema: { type: string }
+        - in: header
+          name: x-sandbox-signature
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentSucceededEvent'
+      responses:
+        '201': { description: Passport issued atomically with ledger posting }
+        '200': { description: Duplicate event already handled }
+        '401': { description: Invalid webhook signature }
+        '409': { description: Payment amount mismatch or agent not verified }
+  /v1/passports/{passport_id}:
+    parameters:
+      - $ref: '#/components/parameters/PassportId'
+    get:
+      security: []
+      summary: Fetch a signed Agent Passport
+      responses:
+        '200': { description: Signed passport claims and current status }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/passports/{passport_id}/status:
+    parameters:
+      - $ref: '#/components/parameters/PassportId'
+    get:
+      security: []
+      summary: Read live passport status
+      responses:
+        '200': { description: Current status }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/passports/{passport_id}/verify:
+    parameters:
+      - $ref: '#/components/parameters/PassportId'
+    post:
+      security: []
+      summary: Verify passport signature, issuer, expiry and live status
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [valid, status, agent_id]
+                properties:
+                  valid: { type: boolean }
+                  status: { type: string }
+                  agent_id: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/passports/{passport_id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/PassportId'
+    post:
+      summary: Revoke a passport owned by the authenticated tenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason_code]
+              properties:
+                reason_code: { type: string, minLength: 3, maxLength: 128 }
+      responses:
+        '200': { description: Revoked }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /.well-known/agent-card.json:
+    get:
+      security: []
+      summary: A2A Protocol v1.0 discovery card
+      responses:
+        '200': { description: A2A Agent Card }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    AgentId:
+      in: path
+      name: agent_id
+      required: true
+      schema: { type: string }
+    PassportId:
+      in: path
+      name: passport_id
+      required: true
+      schema: { type: string }
+  schemas:
+    CreateAgentRequest:
+      type: object
+      additionalProperties: false
+      required: [public_key_pem, endpoint]
+      properties:
+        organization_id: { type: string, format: uuid }
+        public_key_pem:
+          type: string
+          description: Ed25519 public key encoded as SPKI PEM.
+        endpoint: { type: string, format: uri }
+        capabilities:
+          type: array
+          maxItems: 50
+          items: { type: string, maxLength: 128 }
+        referral_code: { type: string }
+    PublicAgent:
+      type: object
+      required: [agent_id, endpoint, capabilities, verification_level, status]
+      properties:
+        agent_id: { type: string }
+        endpoint: { type: string, format: uri }
+        capabilities: { type: array, items: { type: string } }
+        verification_level: { type: integer, minimum: 0, maximum: 3 }
+        status: { enum: [pending, active, suspended, revoked] }
+    PaymentSucceededEvent:
+      type: object
+      additionalProperties: false
+      required: [event_id, type, purchase_id, agent_id, amount_minor, currency]
+      properties:
+        event_id: { type: string }
+        type: { const: payment.succeeded }
+        purchase_id: { type: string }
+        agent_id: { type: string }
+        amount_minor: { type: integer, minimum: 1 }
+        currency: { const: USD }
+  responses:
+    BadRequest:
+      description: Invalid input
+    Forbidden:
+      description: Authenticated principal cannot access the tenant/resource
+    NotFound:
+      description: Resource not found

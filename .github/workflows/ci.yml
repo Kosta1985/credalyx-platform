@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: ['main', 'feat/**']
+  pull_request:
+    branches: ['main']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: credalyx
+          POSTGRES_PASSWORD: credalyx
+          POSTGRES_DB: credalyx
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U credalyx -d credalyx"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://credalyx:credalyx@127.0.0.1:5432/credalyx
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm db:migrate
+      - run: pnpm db:check
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build

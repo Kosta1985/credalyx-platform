@@ -1,0 +1,31 @@
+{
+  "name": "@credalyx/agent-passport-network",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test --import tsx 'test/**/*.test.ts'",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:check": "tsx src/db/check.ts"
+  },
+  "dependencies": {
+    "@fastify/helmet": "^13.0.2",
+    "@fastify/rate-limit": "^10.3.0",
+    "drizzle-orm": "^0.44.5",
+    "fastify": "^5.6.0",
+    "jose": "^6.1.0",
+    "postgres": "^3.4.7",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "drizzle-kit": "^0.31.4",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
