@@ -1,5 +1,5 @@
 import { generateKeyPairSync, sign, verify } from 'node:crypto';
-import { agentKeyId, canonicalize, uuidv7 } from './crypto.js';
+import { agentKeyId, canonicalize, issuerKeyId, uuidv7 } from './crypto.js';
 
 export type Currency = 'USD';
 export type VerificationLevel = 0 | 1 | 2 | 3;
@@ -29,6 +29,7 @@ export interface AgentPassportClaims {
   passport_version: number;
   agent_id: string;
   issuer: string;
+  issuer_key_id?: string;
   subject: string;
   verification_level: VerificationLevel;
   capabilities: string[];
@@ -36,7 +37,7 @@ export interface AgentPassportClaims {
   expires_at: string;
   public_key_reference: string;
   status_reference: string;
-  schema_version: '1.0';
+  schema_version: '1.0' | '1.1';
 }
 
 export interface SignedPassport {
@@ -102,14 +103,21 @@ export class Ledger {
   }
 }
 
+/**
+ * Local synchronous signer retained for tests/dev compatibility.
+ * Production-oriented runtime should prefer the async issuer service backed by
+ * an IssuerSigningBackend so signing keys can remain inside KMS/HSM custody.
+ */
 export class PassportSigner {
   readonly publicKeyPem: string;
+  readonly keyId: string;
   private readonly privateKeyPem: string;
   readonly issuer: string;
 
   constructor(input: { privateKeyPem: string; publicKeyPem: string; issuer: string }) {
     this.privateKeyPem = input.privateKeyPem;
     this.publicKeyPem = input.publicKeyPem;
+    this.keyId = issuerKeyId(input.publicKeyPem);
     this.issuer = input.issuer.replace(/\/$/, '');
   }
 
@@ -138,6 +146,7 @@ export class PassportSigner {
       passport_version: passportVersion,
       agent_id: agent.publicId,
       issuer: this.issuer,
+      issuer_key_id: this.keyId,
       subject: `agent:${agent.publicId}`,
       verification_level: agent.verificationLevel,
       capabilities: [...agent.capabilities].sort(),
@@ -145,7 +154,7 @@ export class PassportSigner {
       expires_at: expires.toISOString(),
       public_key_reference: `${this.issuer}/v1/agents/${agent.publicId}/keys/${encodeURIComponent(keyId)}`,
       status_reference: `${this.issuer}/v1/passports/${passportId}/status`,
-      schema_version: '1.0',
+      schema_version: '1.1',
     };
     const signature = sign(null, Buffer.from(canonicalize(claims)), this.privateKeyPem).toString('base64url');
     return { claims, signature, status: 'active' };
@@ -155,6 +164,7 @@ export class PassportSigner {
     if (passport.status !== 'active') return false;
     if (Date.parse(passport.claims.expires_at) <= nowMs) return false;
     if (passport.claims.issuer !== this.issuer) return false;
+    if (passport.claims.issuer_key_id && passport.claims.issuer_key_id !== this.keyId) return false;
     return verify(
       null,
       Buffer.from(canonicalize(passport.claims)),
