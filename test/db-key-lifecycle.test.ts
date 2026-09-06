@@ -4,7 +4,7 @@ import test from 'node:test';
 import { testHeaderAuthenticator } from '../src/auth.js';
 import { agentKeyId, signSandboxWebhook } from '../src/crypto.js';
 import { PostgresCredentialLifecycleStore } from '../src/credentials/store-postgres.js';
-import { PostgresPlatformStore } from '../src/db/store-postgres.js';
+import { PostgresLifecyclePlatformStore } from '../src/db/store-postgres-lifecycle.js';
 import { PassportSigner } from '../src/domain.js';
 import { SandboxPaymentProvider } from '../src/payments/sandbox.js';
 import { buildApp } from '../src/server.js';
@@ -13,7 +13,7 @@ const databaseUrl = process.env.DATABASE_URL;
 const secret = 'db-key-lifecycle-secret-012345678901234';
 
 test('PostgreSQL rotates an agent key atomically and reissues the paid passport', { skip: !databaseUrl }, async (t) => {
-  const store = new PostgresPlatformStore(databaseUrl!);
+  const store = new PostgresLifecyclePlatformStore(databaseUrl!);
   const credentials = new PostgresCredentialLifecycleStore(databaseUrl!);
   const app = await buildApp({
     store,
@@ -159,4 +159,94 @@ test('PostgreSQL rotates an agent key atomically and reissues the paid passport'
   assert.equal(replacementClaims.passport_version, 2);
   assert.equal(replacementClaims.expires_at, oldClaims.expires_at);
   assert.match(replacementClaims.public_key_reference, /key_ed25519_/);
+});
+
+test('PostgreSQL emergency active-key revocation keeps suspended agent readable and blocks new passport checkout', { skip: !databaseUrl }, async (t) => {
+  const store = new PostgresLifecyclePlatformStore(databaseUrl!);
+  const credentials = new PostgresCredentialLifecycleStore(databaseUrl!);
+  const app = await buildApp({
+    store,
+    credentials,
+    signer: PassportSigner.ephemeral('https://credalyx.db.test'),
+    authenticate: testHeaderAuthenticator(),
+    paymentProvider: new SandboxPaymentProvider(),
+    config: {
+      nodeEnv: 'test',
+      publicBaseUrl: 'https://credalyx.db.test',
+      passportPriceMinor: 200n,
+      referralCommissionMinor: 100n,
+      referralHoldDays: 30,
+      minPayoutMinor: 2500n,
+      passportTtlDays: 30,
+      sandboxWebhookSecret: secret,
+    },
+  });
+  t.after(async () => app.close());
+
+  const runId = `${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+  const owner = `db-emergency-key-owner-${runId}`;
+  const pair = generateKeyPairSync('ed25519');
+  const publicKeyPem = pair.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+  const keyId = agentKeyId(publicKeyPem);
+  const created = await app.inject({
+    method: 'POST',
+    url: '/v1/agents',
+    headers: { 'x-test-subject': owner },
+    payload: {
+      public_key_pem: publicKeyPem,
+      endpoint: `https://${owner}.example/a2a`,
+      capabilities: ['emergency.revoke.test'],
+    },
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  const agentId = created.json<{ agent_id: string }>().agent_id;
+
+  const challengeResponse = await app.inject({
+    method: 'POST',
+    url: `/v1/agents/${agentId}/challenge`,
+    headers: { 'x-test-subject': owner },
+  });
+  assert.equal(challengeResponse.statusCode, 200, challengeResponse.body);
+  const challenge = challengeResponse.json<{ challenge: string; signing_payload: string }>();
+  const verified = await app.inject({
+    method: 'POST',
+    url: `/v1/agents/${agentId}/verify-control`,
+    headers: { 'x-test-subject': owner },
+    payload: {
+      challenge: challenge.challenge,
+      signature: sign(null, Buffer.from(challenge.signing_payload), pair.privateKey).toString('base64url'),
+    },
+  });
+  assert.equal(verified.statusCode, 200, verified.body);
+
+  const revoked = await app.inject({
+    method: 'POST',
+    url: `/v1/agents/${agentId}/keys/${encodeURIComponent(keyId)}/revoke`,
+    headers: { 'x-test-subject': owner },
+    payload: { reason_code: 'suspected_key_compromise' },
+  });
+  assert.equal(revoked.statusCode, 200, revoked.body);
+  assert.equal(revoked.json<{ revoked: boolean }>().revoked, true);
+
+  const agentResponse = await app.inject({ method: 'GET', url: `/v1/agents/${agentId}` });
+  assert.equal(agentResponse.statusCode, 200, agentResponse.body);
+  assert.equal(agentResponse.json<{ status: string }>().status, 'suspended');
+
+  const historicalKey = await app.inject({
+    method: 'GET',
+    url: `/v1/agents/${agentId}/keys/${encodeURIComponent(keyId)}`,
+  });
+  assert.equal(historicalKey.statusCode, 200, historicalKey.body);
+  assert.equal(historicalKey.json<{ active: boolean }>().active, false);
+
+  const currentKey = await app.inject({ method: 'GET', url: `/v1/agents/${agentId}/keys/current` });
+  assert.equal(currentKey.statusCode, 404, currentKey.body);
+
+  const checkout = await app.inject({
+    method: 'POST',
+    url: `/v1/agents/${agentId}/passport-checkout`,
+    headers: { 'x-test-subject': owner, 'idempotency-key': `db-emergency-${runId}-0001` },
+  });
+  assert.equal(checkout.statusCode, 409, checkout.body);
+  assert.equal(checkout.json<{ code: string }>().code, 'AGENT_NOT_ELIGIBLE_FOR_PASSPORT');
 });
