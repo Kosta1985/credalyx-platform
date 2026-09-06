@@ -34,9 +34,9 @@ export class PostgresIssuerKeyRegistryStore implements IssuerKeyRegistryStore {
     const activeKey = activeKeys[0]!;
 
     await this.sql.begin(async (tx) => {
-      type ActiveRow = { id: string; key_id: string };
+      type ActiveRow = { id: string; key_id: string; status: IssuerKeyStatus };
       const currentActive = await tx<ActiveRow[]>`
-        select id, key_id
+        select id, key_id, status
         from issuer_signing_keys
         where status = 'active'
         for update
@@ -69,6 +69,9 @@ export class PostgresIssuerKeyRegistryStore implements IssuerKeyRegistryStore {
         `;
         const existing = existingRows[0];
         if (existing && existing.public_key_pem !== key.publicKeyPem) throw new Error('issuer key ID collision');
+        if (existing?.status === 'revoked' && key.status !== 'revoked') {
+          throw new Error('revoked issuer key cannot be reactivated by backend synchronization');
+        }
         if (!existing) {
           const id = uuidv7();
           await tx`
@@ -172,6 +175,9 @@ export class PostgresIssuerKeyRegistryStore implements IssuerKeyRegistryStore {
       const row = rows[0];
       if (!row) return false;
       if (row.status === status) return true;
+      if (row.status === 'revoked' && status !== 'revoked') {
+        throw new Error('revoked issuer key cannot transition to another status');
+      }
       await tx`
         update issuer_signing_keys
         set status = ${status},
