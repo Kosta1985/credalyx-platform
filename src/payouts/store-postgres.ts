@@ -24,10 +24,10 @@ import type {
 
 type PayoutRow = {
   id: string;
-  payout_reference: string;
-  agent_id: string;
+  payout_reference: string | null;
+  agent_id: string | null;
   payout_account_id: string;
-  provider: string;
+  provider: string | null;
   provider_payout_id: string | null;
   amount_minor: string;
   currency: string;
@@ -57,18 +57,13 @@ export class PostgresPayoutStore implements PayoutStore {
   private readonly sql: ReturnType<typeof postgres>;
 
   constructor(databaseUrl: string) {
-    this.sql = postgres(databaseUrl, {
-      max: 6,
-      idle_timeout: 20,
-      connect_timeout: 10,
-      prepare: false,
-    });
+    this.sql = postgres(databaseUrl, { max: 6, idle_timeout: 20, connect_timeout: 10, prepare: false });
   }
 
   async upsertPayoutAccount(agent: AgentRecord, session: PayoutOnboardingSession, now: Date): Promise<PayoutAccountRecord> {
     return this.sql.begin(async (tx) => {
       const identity = await resolveBeneficiary(tx, agent);
-      const existing = await findPayoutAccount(tx, identity.ownerUserId, identity.organizationId, session.provider, true);
+      const existing = await findPayoutAccount(tx, identity, session.provider, true);
       const id = existing?.id ?? uuidv7();
       if (existing) {
         await tx`
@@ -108,24 +103,27 @@ export class PostgresPayoutStore implements PayoutStore {
   }
 
   async getPayoutAccount(agent: AgentRecord, provider: string): Promise<PayoutAccountRecord | null> {
-    const rows = await this.sql<PayoutAccountRow[]>`
-      select pa.id, pa.provider, pa.provider_account_id, pa.onboarding_status, pa.onboarding_url,
-        pa.onboarding_expires_at, u.external_subject as owner_subject, pa.organization_id
-      from payout_accounts pa
-      left join users u on u.id = pa.owner_user_id
-      where pa.provider = ${provider}
-        and (
-          (${agent.organizationId ?? null}::uuid is not null and pa.organization_id = ${agent.organizationId ?? null})
-          or (${agent.organizationId ?? null}::uuid is null and u.external_subject = ${agent.ownerSubject})
-        )
-      limit 1
-    `;
+    const rows = agent.organizationId
+      ? await this.sql<PayoutAccountRow[]>`
+          select pa.id, pa.provider, pa.provider_account_id, pa.onboarding_status, pa.onboarding_url,
+            pa.onboarding_expires_at, null::text as owner_subject, pa.organization_id
+          from payout_accounts pa
+          where pa.provider = ${provider} and pa.organization_id = ${agent.organizationId}
+          limit 1
+        `
+      : await this.sql<PayoutAccountRow[]>`
+          select pa.id, pa.provider, pa.provider_account_id, pa.onboarding_status, pa.onboarding_url,
+            pa.onboarding_expires_at, u.external_subject as owner_subject, pa.organization_id
+          from payout_accounts pa
+          join users u on u.id = pa.owner_user_id
+          where pa.provider = ${provider} and u.external_subject = ${agent.ownerSubject}
+          limit 1
+        `;
     return rows[0] ? parsePayoutAccount(rows[0]) : null;
   }
 
   async getRiskContext(agentId: string, now: Date): Promise<PayoutRiskContextRecord> {
-    type BalanceRow = { total: string };
-    const balance = await this.sql<BalanceRow[]>`
+    const balance = await this.sql<{ total: string }[]>`
       select coalesce(sum(le.amount_minor), 0)::text as total
       from ledger_accounts la
       join ledger_entries le on le.account_id = la.id
@@ -134,19 +132,13 @@ export class PostgresPayoutStore implements PayoutStore {
         and la.code = 'agent_owner_available_balance'
     `;
     const signed = BigInt(balance[0]?.total ?? '0');
-    const availableMinor = signed < 0n ? -signed : 0n;
-    const debtMinor = signed > 0n ? signed : 0n;
-
-    type CountRow = { open_count: string; count_24h: string };
-    const counts = await this.sql<CountRow[]>`
+    const counts = await this.sql<{ open_count: string; count_24h: string }[]>`
       select
         count(*) filter (where status in ('pending', 'processing'))::text as open_count,
         count(*) filter (where created_at >= ${new Date(now.getTime() - 86_400_000)})::text as count_24h
       from payouts where agent_id = ${agentId}
     `;
-
-    type ReversalRow = { total: string };
-    const reversals = await this.sql<ReversalRow[]>`
+    const reversals = await this.sql<{ total: string }[]>`
       select coalesce(sum(le.amount_minor) filter (where le.amount_minor > 0), 0)::text as total
       from ledger_entries le
       join ledger_accounts la on la.id = le.account_id
@@ -157,8 +149,8 @@ export class PostgresPayoutStore implements PayoutStore {
         and lt.created_at >= ${new Date(now.getTime() - 30 * 86_400_000)}
     `;
     return {
-      availableMinor,
-      debtMinor,
+      availableMinor: signed < 0n ? -signed : 0n,
+      debtMinor: signed > 0n ? signed : 0n,
       openPayoutCount: Number(counts[0]?.open_count ?? '0'),
       payoutCount24h: Number(counts[0]?.count_24h ?? '0'),
       reversalMinor30d: BigInt(reversals[0]?.total ?? '0'),
@@ -187,10 +179,7 @@ export class PostgresPayoutStore implements PayoutStore {
     if (input.assessment.decision !== 'approve') throw new Error('payout risk decision is not approved');
     return this.sql.begin(async (tx) => {
       await tx`select pg_advisory_xact_lock(hashtext(${`credalyx:payout:${input.agent.id}`}))`;
-      const existing = await tx<PayoutRow[]>`
-        select ${payoutColumns()}
-        from payouts where idempotency_key = ${input.idempotencyKey} limit 1
-      `;
+      const existing = await tx<PayoutRow[]>`select * from payouts where idempotency_key = ${input.idempotencyKey} limit 1`;
       if (existing[0]) {
         const payout = parsePayout(existing[0]);
         if (payout.agentId !== input.agent.id || payout.amountMinor !== input.amountMinor || payout.currency !== input.currency) {
@@ -203,12 +192,10 @@ export class PostgresPayoutStore implements PayoutStore {
         select onboarding_status from payout_accounts where id = ${input.payoutAccount.id} limit 1 for update
       `;
       if (accountRows[0]?.onboarding_status !== 'complete') throw new Error('payout account onboarding incomplete');
-
       const open = await tx<{ id: string }[]>`
         select id from payouts where agent_id = ${input.agent.id} and status in ('pending', 'processing') limit 1 for update
       `;
       if (open[0]) throw new Error('open payout already exists');
-
       const balance = await availableBalance(tx, input.agent.id);
       if (balance.debtMinor > 0n || balance.availableMinor < input.amountMinor) throw new Error('insufficient payout balance');
 
@@ -231,8 +218,7 @@ export class PostgresPayoutStore implements PayoutStore {
         occurredAt: input.reservedAt,
       });
       await tx`
-        update payout_risk_assessments
-        set payout_id = ${payoutId}
+        update payout_risk_assessments set payout_id = ${payoutId}
         where agent_id = ${input.agent.id} and idempotency_key = ${input.idempotencyKey} and payout_id is null
       `;
       await tx`
@@ -266,8 +252,7 @@ export class PostgresPayoutStore implements PayoutStore {
 
   async markSubmitted(payoutReference: string, providerPayout: ProviderPayout, submittedAt: Date): Promise<PayoutRecord> {
     return this.sql.begin(async (tx) => {
-      const rows = await lockPayout(tx, payoutReference);
-      const row = rows[0];
+      const row = (await lockPayout(tx, payoutReference))[0];
       if (!row) throw new Error('payout not found');
       const payout = parsePayout(row);
       if (providerPayout.payoutReference !== payoutReference || providerPayout.provider !== payout.provider || providerPayout.amountMinor !== payout.amountMinor || providerPayout.currency !== payout.currency) {
@@ -277,62 +262,44 @@ export class PostgresPayoutStore implements PayoutStore {
       if (payout.status !== 'pending') throw new Error('payout is not pending submission');
 
       if (providerPayout.status === 'processing') {
-        await tx`
-          update payouts set provider_payout_id = ${providerPayout.providerPayoutId}, status = 'processing', submitted_at = ${submittedAt}
-          where id = ${payout.id}
-        `;
+        await tx`update payouts set provider_payout_id = ${providerPayout.providerPayoutId}, status = 'processing', submitted_at = ${submittedAt} where id = ${payout.id}`;
       } else if (providerPayout.status === 'paid') {
         await settle(tx, payout, submittedAt);
-        await tx`
-          update payouts set provider_payout_id = ${providerPayout.providerPayoutId}, status = 'paid', submitted_at = ${submittedAt}, processed_at = ${submittedAt}
-          where id = ${payout.id}
-        `;
+        await tx`update payouts set provider_payout_id = ${providerPayout.providerPayoutId}, status = 'paid', submitted_at = ${submittedAt}, processed_at = ${submittedAt} where id = ${payout.id}`;
       } else {
         await release(tx, payout, submittedAt);
-        await tx`
-          update payouts set provider_payout_id = ${providerPayout.providerPayoutId}, status = 'failed', submitted_at = ${submittedAt}, processed_at = ${submittedAt}, failure_reason = 'provider_submission_failed'
-          where id = ${payout.id}
-        `;
+        await tx`update payouts set provider_payout_id = ${providerPayout.providerPayoutId}, status = 'failed', submitted_at = ${submittedAt}, processed_at = ${submittedAt}, failure_reason = 'provider_submission_failed' where id = ${payout.id}`;
       }
-      const updated = await tx<PayoutRow[]>`select ${payoutColumns()} from payouts where id = ${payout.id}`;
-      return parsePayout(updated[0]!);
+      return parsePayout((await tx<PayoutRow[]>`select * from payouts where id = ${payout.id}`)[0]!);
     });
   }
 
   async failSubmission(payoutReference: string, reason: string, failedAt: Date): Promise<PayoutRecord> {
     return this.sql.begin(async (tx) => {
-      const rows = await lockPayout(tx, payoutReference);
-      const row = rows[0];
+      const row = (await lockPayout(tx, payoutReference))[0];
       if (!row) throw new Error('payout not found');
       const payout = parsePayout(row);
       if (payout.status === 'failed') return payout;
       if (payout.status !== 'pending') throw new Error('only pending payout can fail before submission');
       await release(tx, payout, failedAt);
-      await tx`
-        update payouts set status = 'failed', failure_reason = ${reason}, processed_at = ${failedAt}
-        where id = ${payout.id}
-      `;
-      const updated = await tx<PayoutRow[]>`select ${payoutColumns()} from payouts where id = ${payout.id}`;
-      return parsePayout(updated[0]!);
+      await tx`update payouts set status = 'failed', failure_reason = ${reason}, processed_at = ${failedAt} where id = ${payout.id}`;
+      return parsePayout((await tx<PayoutRow[]>`select * from payouts where id = ${payout.id}`)[0]!);
     });
   }
 
   async applyProviderEvent(input: PayoutProviderEventInput): Promise<PayoutEventResult> {
     return this.sql.begin(async (tx) => {
       const eventRows = await tx<{ id: string }[]>`
-        insert into payout_events (
-          id, provider, provider_event_id, event_type, payload_hash, processing_status, received_at
-        ) values (
-          ${uuidv7()}, ${input.provider}, ${input.eventId}, ${input.eventType}, ${input.payloadHash}, 'processing', ${input.occurredAt}
-        ) on conflict (provider, provider_event_id) do nothing returning id
+        insert into payout_events (id, provider, provider_event_id, event_type, payload_hash, processing_status, received_at)
+        values (${uuidv7()}, ${input.provider}, ${input.eventId}, ${input.eventType}, ${input.payloadHash}, 'processing', ${input.occurredAt})
+        on conflict (provider, provider_event_id) do nothing returning id
       `;
       if (!eventRows[0]) {
-        const existing = await tx<PayoutRow[]>`select ${payoutColumns()} from payouts where payout_reference = ${input.payoutReference} limit 1`;
+        const existing = await tx<PayoutRow[]>`select * from payouts where payout_reference = ${input.payoutReference} limit 1`;
         return { duplicate: true, found: Boolean(existing[0]), ...(existing[0] ? { status: existing[0].status } : {}) };
       }
       const eventId = eventRows[0].id;
-      const rows = await lockPayout(tx, input.payoutReference);
-      const row = rows[0];
+      const row = (await lockPayout(tx, input.payoutReference))[0];
       if (!row) {
         await tx`update payout_events set processing_status = 'ignored_not_found', processed_at = ${input.occurredAt} where id = ${eventId}`;
         return { duplicate: false, found: false };
@@ -342,20 +309,16 @@ export class PostgresPayoutStore implements PayoutStore {
         throw new Error('payout provider event mismatch');
       }
       await tx`update payout_events set payout_id = ${payout.id} where id = ${eventId}`;
-      if (['paid', 'failed', 'cancelled'].includes(payout.status)) {
+      if (payout.status === 'paid' || payout.status === 'failed' || payout.status === 'cancelled') {
         await tx`update payout_events set processing_status = 'duplicate', processed_at = ${input.occurredAt} where id = ${eventId}`;
         return { duplicate: true, found: true, status: payout.status };
       }
-
       if (input.eventType === 'payout.paid') {
         await settle(tx, payout, input.occurredAt);
         await tx`update payouts set status = 'paid', processed_at = ${input.occurredAt} where id = ${payout.id}`;
       } else {
         await release(tx, payout, input.occurredAt);
-        await tx`
-          update payouts set status = 'failed', processed_at = ${input.occurredAt}, failure_reason = ${input.failureReason ?? 'provider_failed'}
-          where id = ${payout.id}
-        `;
+        await tx`update payouts set status = 'failed', processed_at = ${input.occurredAt}, failure_reason = ${input.failureReason ?? 'provider_failed'} where id = ${payout.id}`;
       }
       await tx`update payout_events set processing_status = 'processed', processed_at = ${input.occurredAt} where id = ${eventId}`;
       await tx`
@@ -370,32 +333,26 @@ export class PostgresPayoutStore implements PayoutStore {
   }
 
   async getPayout(payoutReference: string): Promise<PayoutRecord | null> {
-    const rows = await this.sql<PayoutRow[]>`select ${payoutColumns()} from payouts where payout_reference = ${payoutReference} limit 1`;
+    const rows = await this.sql<PayoutRow[]>`select * from payouts where payout_reference = ${payoutReference} limit 1`;
     return rows[0] ? parsePayout(rows[0]) : null;
   }
 
   async listPayouts(agentId: string, limit: number): Promise<PayoutRecord[]> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('payout list limit out of range');
-    const rows = await this.sql<PayoutRow[]>`
-      select ${payoutColumns()} from payouts where agent_id = ${agentId}
-      order by created_at desc, id desc limit ${limit}
-    `;
+    const rows = await this.sql<PayoutRow[]>`select * from payouts where agent_id = ${agentId} order by created_at desc, id desc limit ${limit}`;
     return rows.map(parsePayout);
   }
 
   async getPayoutSummary(agentId: string): Promise<PayoutSummary> {
-    type ReservedRow = { total: string };
-    const reserved = await this.sql<ReservedRow[]>`
+    const reserved = await this.sql<{ total: string }[]>`
       select coalesce(sum(le.amount_minor), 0)::text as total
       from ledger_accounts la
       join ledger_entries le on le.account_id = la.id
       join ledger_transactions lt on lt.id = le.transaction_id and lt.sealed_at is not null
       where la.scope_type = 'agent' and la.scope_id = ${agentId} and la.code = 'agent_owner_reserved_balance'
     `;
-    type PayoutAggregate = { paid: string; open_count: string };
-    const aggregate = await this.sql<PayoutAggregate[]>`
-      select
-        coalesce(sum(amount_minor) filter (where status = 'paid'), 0)::text as paid,
+    const aggregate = await this.sql<{ paid: string; open_count: string }[]>`
+      select coalesce(sum(amount_minor) filter (where status = 'paid'), 0)::text as paid,
         count(*) filter (where status in ('pending', 'processing'))::text as open_count
       from payouts where agent_id = ${agentId}
     `;
@@ -412,7 +369,9 @@ export class PostgresPayoutStore implements PayoutStore {
   }
 }
 
-async function resolveBeneficiary(tx: TransactionSql<{}>, agent: AgentRecord): Promise<{ ownerUserId: string | null; organizationId: string | null }> {
+type BeneficiaryIdentity = { ownerUserId: string | null; organizationId: string | null };
+
+async function resolveBeneficiary(tx: TransactionSql<{}>, agent: AgentRecord): Promise<BeneficiaryIdentity> {
   if (agent.organizationId) return { ownerUserId: null, organizationId: agent.organizationId };
   const users = await tx<{ id: string }[]>`select id from users where external_subject = ${agent.ownerSubject} and deleted_at is null limit 1`;
   if (!users[0]) throw new Error('payout beneficiary owner not found');
@@ -421,24 +380,22 @@ async function resolveBeneficiary(tx: TransactionSql<{}>, agent: AgentRecord): P
 
 async function findPayoutAccount(
   tx: TransactionSql<{}>,
-  ownerUserId: string | null,
-  organizationId: string | null,
+  identity: BeneficiaryIdentity,
   provider: string,
   lock: boolean,
 ): Promise<{ id: string } | null> {
-  const rows = lock
-    ? await tx<{ id: string }[]>`
-        select id from payout_accounts
-        where provider = ${provider}
-          and ((${ownerUserId}::uuid is not null and owner_user_id = ${ownerUserId}) or (${organizationId}::uuid is not null and organization_id = ${organizationId}))
-        limit 1 for update
-      `
-    : await tx<{ id: string }[]>`
-        select id from payout_accounts
-        where provider = ${provider}
-          and ((${ownerUserId}::uuid is not null and owner_user_id = ${ownerUserId}) or (${organizationId}::uuid is not null and organization_id = ${organizationId}))
-        limit 1
-      `;
+  let rows: { id: string }[];
+  if (identity.organizationId) {
+    rows = lock
+      ? await tx<{ id: string }[]>`select id from payout_accounts where provider = ${provider} and organization_id = ${identity.organizationId} limit 1 for update`
+      : await tx<{ id: string }[]>`select id from payout_accounts where provider = ${provider} and organization_id = ${identity.organizationId} limit 1`;
+  } else if (identity.ownerUserId) {
+    rows = lock
+      ? await tx<{ id: string }[]>`select id from payout_accounts where provider = ${provider} and owner_user_id = ${identity.ownerUserId} limit 1 for update`
+      : await tx<{ id: string }[]>`select id from payout_accounts where provider = ${provider} and owner_user_id = ${identity.ownerUserId} limit 1`;
+  } else {
+    throw new Error('invalid payout beneficiary identity');
+  }
   return rows[0] ?? null;
 }
 
@@ -451,24 +408,11 @@ async function availableBalance(tx: TransactionSql<{}>, agentId: string): Promis
     where la.scope_type = 'agent' and la.scope_id = ${agentId} and la.code = 'agent_owner_available_balance'
   `;
   const signed = BigInt(rows[0]?.total ?? '0');
-  return {
-    availableMinor: signed < 0n ? -signed : 0n,
-    debtMinor: signed > 0n ? signed : 0n,
-  };
+  return { availableMinor: signed < 0n ? -signed : 0n, debtMinor: signed > 0n ? signed : 0n };
 }
 
 async function lockPayout(tx: TransactionSql<{}>, payoutReference: string): Promise<PayoutRow[]> {
-  return tx<PayoutRow[]>`
-    select ${payoutColumns()} from payouts where payout_reference = ${payoutReference} limit 1 for update
-  `;
-}
-
-function payoutColumns() {
-  return postgres`
-    id, payout_reference, agent_id, payout_account_id, provider, provider_payout_id,
-    amount_minor::text, currency, status, idempotency_key, risk_decision, risk_score,
-    reserved_at, submitted_at, processed_at, failure_reason, created_at
-  `;
+  return tx<PayoutRow[]>`select * from payouts where payout_reference = ${payoutReference} limit 1 for update`;
 }
 
 function parsePayout(row: PayoutRow): PayoutRecord {
@@ -511,47 +455,24 @@ function parsePayoutAccount(row: PayoutAccountRow): PayoutAccountRecord {
 
 async function postLedger(
   tx: TransactionSql<{}>,
-  input: {
-    idempotencyKey: string;
-    transactionType: string;
-    externalReference: string;
-    entries: readonly LedgerEntry[];
-    occurredAt: Date;
-  },
+  input: { idempotencyKey: string; transactionType: string; externalReference: string; entries: readonly LedgerEntry[]; occurredAt: Date },
 ): Promise<void> {
   assertBalancedEntries(input.entries);
   const existing = await tx<{ id: string }[]>`select id from ledger_transactions where idempotency_key = ${input.idempotencyKey} limit 1`;
   if (existing[0]) return;
   const ledgerTxId = uuidv7();
-  await tx`
-    insert into ledger_transactions (id, idempotency_key, external_reference, transaction_type, created_at)
-    values (${ledgerTxId}, ${input.idempotencyKey}, ${input.externalReference}, ${input.transactionType}, ${input.occurredAt})
-  `;
+  await tx`insert into ledger_transactions (id, idempotency_key, external_reference, transaction_type, created_at) values (${ledgerTxId}, ${input.idempotencyKey}, ${input.externalReference}, ${input.transactionType}, ${input.occurredAt})`;
   for (const entry of input.entries) {
     const accountId = await ensureLedgerAccount(tx, entry.account, entry.scopeType, entry.scopeId);
-    await tx`
-      insert into ledger_entries (id, transaction_id, account_id, amount_minor, currency, created_at)
-      values (${uuidv7()}, ${ledgerTxId}, ${accountId}, ${entry.amountMinor.toString()}, ${entry.currency}, ${input.occurredAt})
-    `;
+    await tx`insert into ledger_entries (id, transaction_id, account_id, amount_minor, currency, created_at) values (${uuidv7()}, ${ledgerTxId}, ${accountId}, ${entry.amountMinor.toString()}, ${entry.currency}, ${input.occurredAt})`;
   }
   await tx`update ledger_transactions set sealed_at = ${input.occurredAt} where id = ${ledgerTxId}`;
 }
 
-async function ensureLedgerAccount(
-  tx: TransactionSql<{}>,
-  code: LedgerAccount,
-  scopeType: 'platform' | 'agent',
-  scopeId: string,
-): Promise<string> {
+async function ensureLedgerAccount(tx: TransactionSql<{}>, code: LedgerAccount, scopeType: 'platform' | 'agent', scopeId: string): Promise<string> {
   const id = uuidv7();
-  await tx`
-    insert into ledger_accounts (id, code, account_type, scope_type, scope_id)
-    values (${id}, ${code}, ${accountTypeFor(code)}, ${scopeType}, ${scopeId})
-    on conflict (code, scope_type, scope_id) do nothing
-  `;
-  const rows = await tx<{ id: string }[]>`
-    select id from ledger_accounts where code = ${code} and scope_type = ${scopeType} and scope_id = ${scopeId} limit 1
-  `;
+  await tx`insert into ledger_accounts (id, code, account_type, scope_type, scope_id) values (${id}, ${code}, ${accountTypeFor(code)}, ${scopeType}, ${scopeId}) on conflict (code, scope_type, scope_id) do nothing`;
+  const rows = await tx<{ id: string }[]>`select id from ledger_accounts where code = ${code} and scope_type = ${scopeType} and scope_id = ${scopeId} limit 1`;
   if (!rows[0]) throw new Error(`failed to resolve ledger account ${code}`);
   return rows[0].id;
 }
