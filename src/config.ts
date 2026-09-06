@@ -46,5 +46,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       throw new Error('trusted JWT verification configuration is required in production');
     }
   }
+  if (parsed.PASSPORT_ISSUER_BACKEND === 'managed') {
+    throw new Error('managed passport issuer backend adapter is not configured in this build');
+  }
   return parsed;
 }
