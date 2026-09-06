@@ -24,6 +24,9 @@ export class MemoryIssuerKeyRegistryStore implements IssuerKeyRegistryStore {
     for (const key of keys) {
       const existing = this.keys.get(key.keyId);
       if (existing && existing.publicKeyPem !== key.publicKeyPem) throw new Error('issuer key ID collision');
+      if (existing?.status === 'revoked' && key.status !== 'revoked') {
+        throw new Error('revoked issuer key cannot be reactivated by backend synchronization');
+      }
       this.keys.set(key.keyId, structuredClone(key));
     }
     if (incomingActive[0]) {
@@ -62,6 +65,9 @@ export class MemoryIssuerKeyRegistryStore implements IssuerKeyRegistryStore {
   ): Promise<boolean> {
     const key = this.keys.get(keyId);
     if (!key) return false;
+    if (key.status === 'revoked' && status !== 'revoked') {
+      throw new Error('revoked issuer key cannot transition to another status');
+    }
     key.status = status;
     if (status === 'retired') {
       key.retiredAt = occurredAt.toISOString();
