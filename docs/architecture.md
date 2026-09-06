@@ -1,60 +1,90 @@
 # Architecture — Agent Passport Network
 
-## Product understanding
+## Product boundary
 
-The platform is a trust layer for software agents. Owners register agents, prove control of an agent key/endpoint, optionally complete stronger organization verification, purchase an internal Agent Passport, and use the passport as a signed, revocable credential during Agent-to-Agent interactions.
+CREDALYX provides a private-sector trust credential for software agents. The credential communicates platform-observed verification state; it does not assert governmental identity, licensing or regulatory approval.
 
-The passport is not a legal identity document or regulatory licence. Payment custody, recipient onboarding and payouts remain with a licensed payment provider; CREDALYX keeps an immutable accounting ledger of platform obligations and events.
+## Architecture style
 
-## Proposed bounded contexts
+The MVP is a **modular monolith with explicit domain boundaries** and one PostgreSQL transaction boundary for critical financial operations. This is intentional: passport issuance, purchase finalization, referral commission creation and ledger posting must be atomic. Premature service separation would increase distributed-transaction risk.
 
-1. Identity & tenancy — users, organizations, memberships, RBAC/ABAC.
-2. Agent registry — agents, endpoints, capabilities, keys and key rotation.
-3. Verification — control challenges, evidence and decisions.
-4. Passport issuer — signed credential issuance, expiry, suspension and revocation.
-5. Trust gateway — A2A discovery, request signing, nonce/timestamp replay defense and scoped authorization.
-6. Commerce — checkout sessions, payment events, refunds and disputes.
-7. Ledger — immutable double-entry accounting and reconciliation.
-8. Referral & payouts — attribution, hold periods, reversals, risk controls and provider-managed payouts.
-9. Audit & risk — append-only privileged events, fraud signals and incident handling.
+Logical modules:
+
+1. Identity / tenancy
+2. Agent registry
+3. Agent key and endpoint control verification
+4. Verification workflow
+5. Passport issuer / status registry
+6. Payment provider adapters
+7. Ledger
+8. Referrals / payouts
+9. Audit / risk / incidents
+10. Public API and A2A discovery
+
+A future monorepo split may separate deployables and SDKs without changing domain interfaces.
 
 ## Trust boundaries
 
-- Browser/client data is always untrusted.
-- Agent endpoints are untrusted until challenge-response ownership is proven.
-- Payment state is authoritative only after verified provider webhooks.
-- Internal services do not trust tenant identifiers supplied by clients; tenant scope is derived from authenticated membership.
-- Public passport verification exposes minimal credential status only.
+- **Owner -> API:** signed JWT from trusted IdP; tenant data is selected from verified claims and server-side membership state.
+- **Agent -> API:** Ed25519 proof of possession; static API keys are not accepted as proof of agent identity.
+- **Payment provider -> API:** provider-specific signed webhook; sandbox currently uses timestamp + canonical payload HMAC.
+- **API -> PostgreSQL:** least-privilege application role; financial writes occur inside transactions.
+- **Passport issuer key:** production target is KMS/HSM. Repository contains no issuer secret.
+- **Agent endpoint:** untrusted network destination. Endpoint fetching/probing must use SSRF-safe egress policy when introduced.
 
-## Initial deployment shape
+## Agent control protocol
 
-Start as a modular monolith with strict domain boundaries. This minimizes distributed-system complexity while keeping modules separable later. PostgreSQL is the source of truth; Redis is reserved for short-lived replay data, jobs and rate-limiting coordination. S3-compatible storage is used only for evidence artifacts that cannot remain in PostgreSQL.
+1. Owner registers an Ed25519 public key and HTTPS A2A endpoint.
+2. API returns 256-bit random challenge plus exact canonical signing payload.
+3. Agent signs `CREDALYX_AGENT_CONTROL_V1 + agent_id + challenge`.
+4. API verifies signature against registered public key.
+5. PostgreSQL atomically consumes the challenge and raises verification to Level 1.
+6. Replay or expired challenge fails.
 
-## Cryptography
+## Passport
 
-- Passport signing: Ed25519.
-- Agent control: agent signs server-issued random challenge with registered public key.
-- Request authentication: canonical request signature covering method, path, body digest, timestamp and nonce.
-- Replay window: short timestamp window plus nonce uniqueness.
-- Key material: production issuer private keys belong in cloud KMS/HSM-backed key management, never source code or database plaintext.
+Current passport uses Ed25519 over deterministic canonical JSON claims. Claims contain no owner email/name. Public status is resolved separately so suspension/revocation takes effect without reissuing old credentials.
 
-## Financial model
+Production key requirements:
 
-Amounts are integer minor units with explicit currency. Each ledger transaction is immutable, idempotent and balanced. Refunds, disputes and corrections are represented with compensating entries. Referral commission first enters pending liability and can become available only after configurable risk hold and eligibility checks.
+- stable key ID/version;
+- managed private-key custody;
+- rotation overlap;
+- public verification-key endpoint/JWKS or equivalent;
+- incident revocation procedure.
 
-Price and referral commission are configuration/policy data, not hard-coded commercial assumptions in the final production implementation.
+## Payments and ledger
 
-## MVP vertical slice
+The platform stores accounting facts, not card credentials and not a self-built bank account.
 
-1. Register agent.
-2. Create one-time challenge.
-3. Verify agent control.
-4. Receive verified sandbox `payment.succeeded` webhook.
-5. Issue Ed25519-signed passport.
-6. Record balanced sale and pending referral commission.
-7. Publicly verify passport status/signature.
-8. Revoke passport and make further verification fail.
+Payment provider flow:
 
-## Known MVP limitations
+1. hosted checkout session at licensed provider;
+2. signed provider webhook;
+3. idempotent event reservation;
+4. verified-agent precondition;
+5. atomic purchase + passport + ledger + commission;
+6. commission held until configured risk window ends;
+7. refunds/chargebacks use compensating transactions;
+8. payouts use provider-managed connected-account/onboarding capability.
 
-Current sandbox foundation uses in-memory repositories and a simplified sandbox webhook signature seam. It is intentionally not production persistence. PostgreSQL migrations, real asymmetric agent challenge verification, provider SDK integration, authentication/tenant middleware, audit persistence, hold/reversal jobs and KMS-backed issuer keys are the next implementation steps before any production use.
+Ledger convention: positive amounts are debits, negative amounts are credits. Every transaction sums to zero per currency.
+
+Ledger accounts are scoped:
+
+- platform accounts use scope `(platform, platform)`;
+- referral balances use `(agent, <referrer internal id>)`.
+
+PostgreSQL seals a transaction only after checking it contains at least two entries and balances. After sealing, entries cannot be added, updated or deleted.
+
+## A2A interoperability
+
+A2A v1.0 discovery is exposed with `supportedInterfaces[]`, not the removed v0.3 top-level transport fields. Current Agent Card advertises only the passport-verification skill. Full task/message handling is intentionally not claimed yet.
+
+## Data minimization
+
+Public agent and passport responses contain agent technical metadata only. Owner identity is not embedded into passports. Verification evidence is referenced rather than copied into public objects. Payment card data is never accepted by CREDALYX endpoints.
+
+## Evolution
+
+The persistence and payment layers are interfaces. Provider, price, commission amount, hold window and issuer implementation are configuration/injected adapters rather than hard-coded business assumptions.
