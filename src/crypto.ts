@@ -39,6 +39,14 @@ export function assertEd25519PublicKey(publicKeyPem: string): void {
   if (key.asymmetricKeyType !== 'ed25519') throw new Error('agent public key must be Ed25519');
 }
 
+export function agentKeyId(publicKeyPem: string): string {
+  const key = createPublicKey(publicKeyPem);
+  if (key.asymmetricKeyType !== 'ed25519') throw new Error('agent public key must be Ed25519');
+  const der = key.export({ format: 'der', type: 'spki' });
+  const fingerprint = createHash('sha256').update(der).digest('base64url');
+  return `key_ed25519_${fingerprint}`;
+}
+
 export function createChallenge(): string {
   return randomBytes(32).toString('base64url');
 }
@@ -47,8 +55,35 @@ export function challengeDigest(challenge: string): string {
   return createHash('sha256').update(challenge).digest('hex');
 }
 
-export function agentControlMessage(agentPublicId: string, challenge: string): string {
-  return `CREDALYX_AGENT_CONTROL_V1\nagent_id=${agentPublicId}\nchallenge=${challenge}`;
+export function agentControlMessage(agentPublicId: string, challenge: string, keyId?: string): string {
+  const keyLine = keyId ? `\nkey_id=${keyId}` : '';
+  return `CREDALYX_AGENT_CONTROL_V1\nagent_id=${agentPublicId}${keyLine}\nchallenge=${challenge}`;
+}
+
+export function keyRotationMessage(input: {
+  agentPublicId: string;
+  rotationId: string;
+  oldKeyId: string;
+  newKeyId: string;
+  challenge: string;
+}): string {
+  return [
+    'CREDALYX_AGENT_KEY_ROTATION_V1',
+    `agent_id=${input.agentPublicId}`,
+    `rotation_id=${input.rotationId}`,
+    `old_key_id=${input.oldKeyId}`,
+    `new_key_id=${input.newKeyId}`,
+    `challenge=${input.challenge}`,
+  ].join('\n');
+}
+
+export function verifyEd25519Signature(publicKeyPem: string, message: string, signatureBase64Url: string): boolean {
+  try {
+    assertEd25519PublicKey(publicKeyPem);
+    return verify(null, Buffer.from(message, 'utf8'), publicKeyPem, Buffer.from(signatureBase64Url, 'base64url'));
+  } catch {
+    return false;
+  }
 }
 
 export function verifyAgentControlSignature(
@@ -56,18 +91,9 @@ export function verifyAgentControlSignature(
   agentPublicId: string,
   challenge: string,
   signatureBase64Url: string,
+  keyId?: string,
 ): boolean {
-  try {
-    assertEd25519PublicKey(publicKeyPem);
-    return verify(
-      null,
-      Buffer.from(agentControlMessage(agentPublicId, challenge), 'utf8'),
-      publicKeyPem,
-      Buffer.from(signatureBase64Url, 'base64url'),
-    );
-  } catch {
-    return false;
-  }
+  return verifyEd25519Signature(publicKeyPem, agentControlMessage(agentPublicId, challenge, keyId), signatureBase64Url);
 }
 
 export function signSandboxWebhook(secret: string, timestampSeconds: number, body: unknown): string {
