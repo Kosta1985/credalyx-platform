@@ -30,7 +30,7 @@ jobs:
       DATABASE_URL: postgres://credalyx:credalyx@127.0.0.1:5432/credalyx
       NODE_ENV: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v4
         with:
           version: 10
